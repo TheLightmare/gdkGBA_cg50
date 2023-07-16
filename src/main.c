@@ -77,7 +77,7 @@ int main(void) {
     fclose(image);
 
     // TODO : make so other games can be loaded, this is just for debug
-    image = fopen("zelda.gba", "rb");
+    image = fopen("test.gba", "rb");
 
     if (image == NULL) {
         dclear(C_WHITE);
@@ -90,6 +90,13 @@ int main(void) {
         return 0;
     }
 
+    //DEBUG
+    dclear(C_WHITE);
+    dtext(1, 1, C_BLACK, "loaded ROM image");
+    dupdate();
+    getkey();
+    //====
+
     fseek(image, 0, SEEK_END);
 
     cart_rom_size = ftell(image);
@@ -98,11 +105,21 @@ int main(void) {
     if (cart_rom_size > max_rom_sz) cart_rom_size = max_rom_sz;
 
     fseek(image, 0, SEEK_SET);
+
+    //DEBUG
+    dclear(C_WHITE);
+    dtext(1, 1, C_BLACK, "reading ROM image...");
+    dupdate();
+    getkey();
+    //====
+
+    // THIS MAKES EVERYTHING CRASH, try to find better alternative.
     fread(rom, cart_rom_size, 1, image);
 
     fclose(image);
 
     arm_reset();
+
 
     bool run = true;
 
