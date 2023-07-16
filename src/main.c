@@ -100,6 +100,14 @@ int main(void) {
     fseek(image, 0, SEEK_END);
 
     cart_rom_size = ftell(image);
+
+    //DEBUG
+    dclear(C_WHITE);
+    dprint(1, 1, C_BLACK, "cart_rom_size : %ld bytes", cart_rom_size);
+    dupdate();
+    getkey();
+    //====
+
     cart_rom_mask = to_pow2(cart_rom_size) - 1;
 
     if (cart_rom_size > max_rom_sz) cart_rom_size = max_rom_sz;
