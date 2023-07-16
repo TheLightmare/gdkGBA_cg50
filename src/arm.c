@@ -3134,7 +3134,7 @@ void arm_init() {
     pram   = malloc(0x400);
     vram   = malloc(0x18000);
     oam    = malloc(0x400);
-    rom    = malloc(0x2000000);
+    rom    = malloc(0x600000); // ORIGINAL : 0x2000000 = 33 554 432 bytes    EDITED : 0x600000 = 6291456 bytes
     eeprom = malloc(0x2000);
     sram   = malloc(0x10000);
     flash  = malloc(0x20000);

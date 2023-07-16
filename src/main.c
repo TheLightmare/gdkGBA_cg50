@@ -124,6 +124,13 @@ int main(void) {
     // THIS MAKES EVERYTHING CRASH, try to find better alternative.
     fread(rom, cart_rom_size, 1, image);
 
+    //DEBUG
+    dclear(C_WHITE);
+    dtext(1, 1, C_BLACK, "Successfully read ROM !");
+    dupdate();
+    getkey();
+    //====
+
     fclose(image);
 
     arm_reset();
