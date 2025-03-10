@@ -10,6 +10,7 @@
 
 #include "arm.h"
 #include "arm_mem.h"
+#include "rom_buffer.h"
 
 #include "io.h"
 
@@ -92,7 +93,7 @@ int main(void) {
 
     //DEBUG
     dclear(C_WHITE);
-    dtext(1, 1, C_BLACK, "loaded ROM image");
+    dtext(1, 1, C_BLACK, "loading ROM image");
     dupdate();
     getkey();
     //====
@@ -112,26 +113,24 @@ int main(void) {
 
     if (cart_rom_size > max_rom_sz) cart_rom_size = max_rom_sz;
 
-    fseek(image, 0, SEEK_SET);
-
-    //DEBUG
-    dclear(C_WHITE);
-    dtext(1, 1, C_BLACK, "reading ROM image...");
-    dupdate();
-    getkey();
-    //====
-
-    // THIS MAKES EVERYTHING CRASH, try to find better alternative.
-    fread(rom, cart_rom_size, 1, image);
-
-    //DEBUG
-    dclear(C_WHITE);
-    dtext(1, 1, C_BLACK, "Successfully read ROM !");
-    dupdate();
-    getkey();
-    //====
-
+    // Close the file handle - we'll reopen it in the buffer system
     fclose(image);
+    
+    // Initialize the ROM buffer system instead of loading the entire ROM
+    if (!rom_buffer_init(&rom_buffer, "test.gba", cart_rom_mask)) {
+        dclear(C_WHITE);
+        dtext(1, 1, C_BLACK, "Error initializing ROM buffer system");
+        dupdate();
+        getkey();
+        return 0;
+    }
+
+    //DEBUG
+    dclear(C_WHITE);
+    dtext(1, 1, C_BLACK, "Successfully initialized ROM buffer!");
+    dupdate();
+    getkey();
+    //====
 
     arm_reset();
 
@@ -195,6 +194,9 @@ int main(void) {
         } */
     }
 
+    // Clean up ROM buffer resources
+    rom_buffer_cleanup(&rom_buffer);
+    
     gint_gba_uninit();
     arm_uninit();
 

@@ -1,7 +1,7 @@
 #include "arm.h"
 #include "arm_mem.h"
-
 #include "io.h"
+#include "rom_buffer.h"
 
 #define EEPROM_WRITE  2
 #define EEPROM_READ   3
@@ -14,7 +14,7 @@ uint8_t *iwram;
 uint8_t *pram;
 uint8_t *vram;
 uint8_t *oam;
-uint8_t *rom;
+RomBuffer rom_buffer;
 uint8_t *eeprom;
 uint8_t *sram;
 uint8_t *flash;
@@ -111,7 +111,7 @@ static uint8_t oam_read(uint32_t address) {
 }
 
 static uint8_t rom_read(uint32_t address) {
-    return rom[address & cart_rom_mask];
+    return rom_buffer_read_8(&rom_buffer, address);
 }
 
 static uint8_t rom_eep_read(uint32_t address, uint8_t offset) {

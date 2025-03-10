@@ -2,50 +2,42 @@
 #define ARM_MEM_H
 
 #include <stdint.h>
+#include "rom_buffer.h"
 
-extern uint8_t *bios;
-extern uint8_t *wram;
-extern uint8_t *iwram;
-extern uint8_t *pram;
-extern uint8_t *vram;
-extern uint8_t *oam;
-extern uint8_t *rom;
-extern uint8_t *eeprom;
-extern uint8_t *sram;
-extern uint8_t *flash;
+// ROM access
+extern RomBuffer rom_buffer;
 
-extern uint32_t palette[0x200];
-
-extern uint32_t bios_op;
-
-extern int64_t cart_rom_size;
+// Original ROM buffer (replace with ROM buffer system)
+// extern uint8_t *rom;
+extern uint32_t cart_rom_size;
 extern uint32_t cart_rom_mask;
 
-extern uint16_t eeprom_idx;
+// BIOS
+extern uint8_t bios[16384];
+extern uint32_t bios_mask;
 
-typedef enum {
-    NON_SEQ,
-    SEQUENTIAL
-} access_type_e;
+// WRAM
+extern uint8_t wram_board[0x00010000];
+extern uint8_t wram_chip[0x00008000];
 
-uint8_t arm_readb(uint32_t address);
-uint32_t arm_readh(uint32_t address);
-uint32_t arm_read(uint32_t address);
-uint8_t arm_readb_n(uint32_t address);
-uint32_t arm_readh_n(uint32_t address);
-uint32_t arm_read_n(uint32_t address);
-uint8_t arm_readb_s(uint32_t address);
-uint32_t arm_readh_s(uint32_t address);
-uint32_t arm_read_s(uint32_t address);
+extern uint8_t palette_ram[0x00000400];
+extern uint8_t vram[0x00018000];
+extern uint8_t oam[0x00000400];
 
-void arm_writeb(uint32_t address, uint8_t value);
-void arm_writeh(uint32_t address, uint16_t value);
-void arm_write(uint32_t address, uint32_t value);
-void arm_writeb_n(uint32_t address, uint8_t value);
-void arm_writeh_n(uint32_t address, uint16_t value);
-void arm_write_n(uint32_t address, uint32_t value);
-void arm_writeb_s(uint32_t address, uint8_t value);
-void arm_writeh_s(uint32_t address, uint16_t value);
-void arm_write_s(uint32_t address, uint32_t value);
+// IO stuff
+typedef union {
+    struct { uint16_t l, h; };
+    uint32_t w;
+} reg32_t;
+
+extern reg32_t key_input;
+
+uint8_t mem_read_8(uint32_t address);
+uint16_t mem_read_16(uint32_t address);
+uint32_t mem_read_32(uint32_t address);
+
+void mem_write_8(uint32_t address, uint8_t value);
+void mem_write_16(uint32_t address, uint16_t value);
+void mem_write_32(uint32_t address, uint32_t value);
 
 #endif
