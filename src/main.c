@@ -1,0 +1,482 @@
+// GINT LIBS =====
+#include <gint/display.h>
+#include <gint/keyboard.h>
+#include <gint/kmalloc.h>
+#include <gint/bfile.h>
+
+#include "gint_gba.h"
+//===============
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "arm.h"
+#include "arm_mem.h"
+#include "rom_buffer.h"
+#include "extram.h"
+
+#include "io.h"
+
+#include "video.h"
+
+
+const int64_t max_rom_sz = 32 * 1024 * 1024;
+
+// Scan storage memory for the first .gba file. On success, writes the
+// basename (e.g. "Pokemon.gba") into `out` and returns true. Falls back
+// to "test.gba" so existing setups keep working.
+static bool find_first_gba_rom(char *out, size_t outsize) {
+    int handle;
+    uint16_t found[256];
+    struct BFile_FileInfo info;
+
+    int r = BFile_FindFirst(u"\\\\fls0\\*.gba", &handle, found, &info);
+    if (r < 0) {
+        // No matching file found -- fall back to legacy default.
+        snprintf(out, outsize, "test.gba");
+        return false;
+    }
+    BFile_FindClose(handle);
+
+    // FONTCHARACTER -> char (ASCII subset). Filenames in user storage are
+    // basically ASCII; characters above 0x7F would be Casio-specific
+    // multi-byte sequences but those don't appear in normal .gba names.
+    size_t len = 0;
+    while (found[len] != 0 && len < outsize - 1) {
+        out[len] = (char)(found[len] & 0xFF);
+        len++;
+    }
+    out[len] = 0;
+    return true;
+}
+
+static uint32_t to_pow2(uint32_t val) {
+    val--;
+
+    val |= (val >>  1);
+    val |= (val >>  2);
+    val |= (val >>  4);
+    val |= (val >>  8);
+    val |= (val >> 16);
+
+    return val + 1;
+}
+
+int main(void) {
+    // Probe and register the optional extram arena BEFORE any heap-heavy
+    // initialisation. ewram_init() will then prefer extram over the BSS
+    // fallback for the 256 KB EWRAM allocation.
+    extram_init();
+    ewram_init();
+
+    dclear(C_WHITE);
+    dtext (1, 20, C_BLACK, "gdkGBA - Gameboy Advance emulator made by gdkchan");
+    dtext (1, 40, C_BLACK, "ported to fx-CG50 by Lightmare");
+    dtext (1, 60, C_BLACK, "This is FREE software released into the PUBLIC DOMAIN");
+    dprint(1, 90, C_BLACK, "%s", extram_status);
+    dprint(1,110, C_BLACK, "EWRAM: %u KB (mask 0x%05X)",
+           (unsigned)(ewram_size / 1024), (unsigned)ewram_mask);
+    dupdate();
+
+    getkey();
+
+    gint_gba_init();
+    arm_init();
+
+
+    //TODO : make an actual ROM select menu
+    
+    /* if (argc < 2) {
+        printf("Error: Invalid number of arguments!\n");
+        printf("Please specify a ROM file.\n");
+
+        return 0;
+    } */
+
+
+    FILE *image;
+
+    image = fopen("gba_bios.bin", "rb");
+
+    if (image == NULL) {
+        //printf("Error: GBA BIOS not found!\n");
+        //printf("Place it on this directory with the name \"gba_bios.bin\".\n");
+        dclear(C_WHITE);
+        dtext(1, 1, C_BLACK, "Error: GBA BIOS not found!");
+        dtext(1, 20, C_BLACK, "Place it on this directory with the name \"gba_bios.bin\".");
+        dupdate();
+
+        getkey();
+
+        return 0;
+    }
+
+    size_t bios_read = fread(bios, 1, 16384, image);
+
+    fclose(image);
+
+    // Print BIOS bytes at the addresses where the ARM core has been seen
+    // looping (0x00, 0x18 = IRQ vector, 0x28, 0x2C). Word-decoded for ARM.
+    dclear(C_WHITE);
+    dprint(1,   1, C_BLACK, "BIOS bytes read: %u", (unsigned)bios_read);
+    dprint(1,  20, C_BLACK, "0x00:%02X%02X%02X%02X 0x04:%02X%02X%02X%02X",
+           bios[0], bios[1], bios[2], bios[3],
+           bios[4], bios[5], bios[6], bios[7]);
+    dprint(1,  40, C_BLACK, "0x18:%02X%02X%02X%02X 0x1C:%02X%02X%02X%02X",
+           bios[0x18], bios[0x19], bios[0x1A], bios[0x1B],
+           bios[0x1C], bios[0x1D], bios[0x1E], bios[0x1F]);
+    dprint(1,  60, C_BLACK, "0x20:%02X%02X%02X%02X 0x24:%02X%02X%02X%02X",
+           bios[0x20], bios[0x21], bios[0x22], bios[0x23],
+           bios[0x24], bios[0x25], bios[0x26], bios[0x27]);
+    dprint(1,  80, C_BLACK, "0x28:%02X%02X%02X%02X 0x2C:%02X%02X%02X%02X",
+           bios[0x28], bios[0x29], bios[0x2A], bios[0x2B],
+           bios[0x2C], bios[0x2D], bios[0x2E], bios[0x2F]);
+    dupdate();
+    getkey();
+
+    // Find the first .gba file in storage memory. Fall back to "test.gba"
+    // so existing setups still work without renaming.
+    char rom_path[64];
+    bool rom_was_found = find_first_gba_rom(rom_path, sizeof(rom_path));
+
+    image = fopen(rom_path, "rb");
+
+    if (image == NULL) {
+        dclear(C_WHITE);
+        dtext(1, 1, C_BLACK, "Error: ROM file couldn't be opened.");
+        dprint(1, 20, C_BLACK, "Tried: %s", rom_path);
+        dtext(1, 40, C_BLACK, rom_was_found
+            ? "(file was found by directory scan)"
+            : "(no .gba files in storage; place one alongside fxgba.g3a)");
+        dupdate();
+
+        getkey();
+
+        return 0;
+    }
+
+    //DEBUG
+    dclear(C_WHITE);
+    dtext(1,  1, C_BLACK, "loading ROM image:");
+    dprint(1, 20, C_BLACK, "%s", rom_path);
+    dtext(1, 40, C_BLACK, rom_was_found
+        ? "(found by directory scan)"
+        : "(fallback to test.gba)");
+    dupdate();
+    getkey();
+    //====
+
+    fseek(image, 0, SEEK_END);
+
+    cart_rom_size = ftell(image);
+
+    //DEBUG
+    dclear(C_WHITE);
+    dprint(1, 1, C_BLACK, "cart_rom_size : %ld bytes", cart_rom_size);
+    dupdate();
+    getkey();
+    //====
+
+    cart_rom_mask = to_pow2(cart_rom_size) - 1;
+
+    if (cart_rom_size > max_rom_sz) cart_rom_size = max_rom_sz;
+
+    // Close the file handle - we'll reopen it in the buffer system
+    fclose(image);
+    
+    // Initialize the ROM buffer system instead of loading the entire ROM
+    rom_init_status_e rb_status;
+    int rb_failed_chunk;
+    if (!rom_buffer_init(&rom_buffer, rom_path, cart_rom_mask,
+                         &rb_status, &rb_failed_chunk)) {
+        // Probe the largest currently-available block in the user-RAM arena so
+        // we can tell whether the failure is heap exhaustion or something else.
+        size_t largest = 0;
+        void *probe = kmalloc_max(&largest, "_uram");
+        if (probe) kfree(probe);
+
+        dclear(C_WHITE);
+        dtext(1, 1, C_BLACK, "Error initializing ROM buffer system");
+
+        switch (rb_status) {
+            case ROM_INIT_FOPEN_FAILED:
+                dprint(1, 20, C_BLACK, "fopen(\"%s\") failed", rom_path);
+                break;
+            case ROM_INIT_MALLOC_FAILED:
+                dprint(1, 20, C_BLACK,
+                       "malloc failed at chunk %d/%d (each %d KB)",
+                       rb_failed_chunk, ROM_BUFFER_CHUNKS,
+                       ROM_CHUNK_SIZE / 1024);
+                break;
+            default:
+                dtext(1, 20, C_BLACK, "Unknown error");
+                break;
+        }
+
+        dprint(1, 40, C_BLACK, "Largest free block (_uram): %u bytes",
+               (unsigned)largest);
+
+        dupdate();
+        getkey();
+        return 0;
+    }
+
+    //DEBUG
+    dclear(C_WHITE);
+    dtext (1,  1, C_BLACK, "Successfully initialized ROM buffer!");
+    dprint(1, 20, C_BLACK, "active chunks: %d/%d  (each %d KB)",
+           rom_buffer.active_chunks, ROM_BUFFER_CHUNKS, ROM_CHUNK_SIZE / 1024);
+    dprint(1, 40, C_BLACK, "%s", extram_status);
+    dupdate();
+    getkey();
+    //====
+
+    arm_reset();
+
+
+    // One-shot BIOS + cart dump to log file at boot.
+    {
+        FILE *log = fopen("fxgba_log.txt", "w");
+        if (log) {
+            fprintf(log, "=== fxgba diagnostic log ===\n");
+            fprintf(log, "build: %s %s tag=43 (LE-fetch fix)\n",
+                    __DATE__, __TIME__);
+            // Runtime endian probe: write a known value and inspect bytes.
+            { union { uint32_t w; uint8_t b[4]; } u;
+              u.w = 0x01020304;
+              fprintf(log, "endian probe: w=01020304 -> b[]=%02X %02X %02X %02X (host is %s)\n",
+                      u.b[0], u.b[1], u.b[2], u.b[3],
+                      (u.b[0] == 0x01) ? "BE" : (u.b[0] == 0x04) ? "LE" : "MIXED");
+#ifdef __BYTE_ORDER__
+              fprintf(log, "__BYTE_ORDER__=%d  __ORDER_LITTLE_ENDIAN__=%d  __ORDER_BIG_ENDIAN__=%d\n",
+                      __BYTE_ORDER__, __ORDER_LITTLE_ENDIAN__, __ORDER_BIG_ENDIAN__);
+#endif
+            }
+            // Show the live POSTFLG so we can confirm this build's setting.
+            extern uint8_t post_boot;
+            fprintf(log, "POSTFLG at boot: %u\n", (unsigned)post_boot);
+            fprintf(log, "BIOS bytes read: %u\n", (unsigned)bios_read);
+
+            // Dump key Thumb decoder slots. If t16_blx_h1 was correctly
+            // unregistered, slots 0x740-0x77F should equal arm_und.
+            extern void (*thumb_proc[2048])();
+            // arm_und is static, but we can look at its slot indirectly:
+            // the default-fill leaves *all* unmapped slots equal, so any
+            // slot we know we never registered (e.g. 0b11101100000 = 0x760
+            // which is NEVER mapped, even before the fix) is arm_und.
+            void *arm_und_addr = (void *)thumb_proc[0x760];
+            fprintf(log, "arm_und addr = %p\n", arm_und_addr);
+            fprintf(log, "thumb[0x740] = %p (E800 BLX suffix; should == arm_und)\n",
+                    (void *)thumb_proc[0x740]);
+            fprintf(log, "thumb[0x750] = %p (EA00; should == arm_und)\n",
+                    (void *)thumb_proc[0x750]);
+            fprintf(log, "thumb[0x77F] = %p (EFFE; should == arm_und)\n",
+                    (void *)thumb_proc[0x77F]);
+            fprintf(log, "thumb[0x780] = %p (F000 BL prefix; != arm_und)\n",
+                    (void *)thumb_proc[0x780]);
+            fprintf(log, "thumb[0x7C0] = %p (F800 BL suffix; != arm_und)\n",
+                    (void *)thumb_proc[0x7C0]);
+            fprintf(log, "thumb[0x238] = %p (4700 BX; != arm_und)\n",
+                    (void *)thumb_proc[0x238]);
+            fprintf(log, "thumb[0x23C] = %p (4780 BLX reg; should == arm_und)\n",
+                    (void *)thumb_proc[0x23C]);
+            fprintf(log, "\n");
+            // First 0x140 bytes (vectors + IRQ handler + FIQ shared code).
+            for (int i = 0; i < 0x140; i += 16) {
+                fprintf(log, "%04X:", i);
+                for (int j = 0; j < 16; j++) fprintf(log, " %02X", bios[i + j]);
+                fprintf(log, "\n");
+            }
+            // SWI dispatcher area.
+            fprintf(log, "\nSWI dispatcher (0x140):\n");
+            for (int i = 0x140; i < 0x180; i += 16) {
+                fprintf(log, "%04X:", i);
+                for (int j = 0; j < 16; j++) fprintf(log, " %02X", bios[i + j]);
+                fprintf(log, "\n");
+            }
+            fprintf(log, "\n");
+            fclose(log);
+        }
+    }
+
+    extern arm_regs_t arm_r;
+    extern bool int_halt;
+    extern volatile uint8_t arm_first_low_set;
+    arm_first_low_set = 0;  // Ignore the arm_reset path; only record real
+                            // mid-execution branches into BIOS region.
+
+    // After arm_reset the rom_buffer chunks are already populated (from the
+    // first cart fetch). Dump a small bounded range around the address where
+    // the cart is known to spin, so we can decode the loop. Small enough not
+    // to thrash the chunk cache.
+    {
+        FILE *log = fopen("fxgba_log.txt", "a");
+        if (log) {
+            fprintf(log, "Cart 0x08040BE0..0x08040C20:\n");
+            for (int i = 0; i < 0x40; i++) {
+                if (i % 16 == 0) fprintf(log, "%08X:", 0x08040BE0 + i);
+                fprintf(log, " %02X", arm_readb(0x08040BE0 + i));
+                if (i % 16 == 15) fprintf(log, "\n");
+            }
+            fprintf(log, "\n");
+            fclose(log);
+        }
+    }
+
+    // Wipe gint_vram once before starting the emulation loop so leftover
+    // boot-screen text outside the centered GBA viewport doesn't bleed
+    // into the displayed frame. The viewport itself gets overwritten every
+    // frame by render_line() so this only affects the margins.
+    dclear(C_BLACK);
+    dupdate();
+
+    bool run = true;
+    uint32_t loop_frame = 0;
+    int dumps_done = 0;
+
+    while (run) {
+        run_frame();
+
+        clearevents();
+
+        if (keydown(KEY_MENU) || keydown(KEY_EXIT)) {
+            run = false;
+            continue;
+        }
+
+        uint16_t pressed = 0;
+        if (keydown(KEY_UP))    pressed |= BTN_U;
+        if (keydown(KEY_DOWN))  pressed |= BTN_D;
+        if (keydown(KEY_LEFT))  pressed |= BTN_L;
+        if (keydown(KEY_RIGHT)) pressed |= BTN_R;
+        if (keydown(KEY_SHIFT)) pressed |= BTN_A;
+        if (keydown(KEY_ALPHA)) pressed |= BTN_B;
+        if (keydown(KEY_F1))    pressed |= BTN_LT;
+        if (keydown(KEY_F6))    pressed |= BTN_RT;
+        if (keydown(KEY_OPTN))  pressed |= BTN_SEL;
+        if (keydown(KEY_EXE))   pressed |= BTN_STA;
+
+        key_input.w = 0x3ff & ~pressed;
+
+        // Capture diagnostic snapshots into a single in-memory buffer first,
+        // then dump in one fwrite. fprintf-by-piece in gint world has been
+        // crashing the calculator. Take 5 snapshots at frames 1, 5, 30, 60,
+        // 120 so we have data even if a later one panics the OS.
+        loop_frame++;
+        static const uint32_t snapshot_frames[5] = { 1, 5, 30, 60, 120 };
+        if (dumps_done < 5 && loop_frame == snapshot_frames[dumps_done]) {
+            char buf[1024];
+            int n = 0;
+            n += snprintf(buf + n, sizeof(buf) - n,
+                "--- snap %d (frame %lu) ---\n",
+                dumps_done, (unsigned long)loop_frame);
+            n += snprintf(buf + n, sizeof(buf) - n,
+                "PC=%08lX CPSR=%08lX halt=%d\n",
+                (unsigned long)arm_r.r[15],
+                (unsigned long)arm_r.cpsr,
+                (int)int_halt);
+            n += snprintf(buf + n, sizeof(buf) - n,
+                "IE=%04X IF=%04X IME=%X DISPCNT=%04X PAL0=%04X\n",
+                (unsigned)int_enb.w, (unsigned)int_ack.w,
+                (unsigned)(int_enb_m.w & 1),
+                (unsigned)disp_cnt.w, (unsigned)palette[0]);
+            for (int i = 0; i < 16; i += 4) {
+                n += snprintf(buf + n, sizeof(buf) - n,
+                    "r%d-r%d: %08lX %08lX %08lX %08lX\n",
+                    i, i + 3,
+                    (unsigned long)arm_r.r[i + 0],
+                    (unsigned long)arm_r.r[i + 1],
+                    (unsigned long)arm_r.r[i + 2],
+                    (unsigned long)arm_r.r[i + 3]);
+            }
+            // 32 bytes around current PC: 8 before, 24 from PC onwards.
+            // For BIOS reads from bios[] directly. For cart reads via
+            // rom_buffer through arm_readb -- this triggers at most one
+            // chunk load since the snapshot only fires every 30 frames.
+            uint32_t pc = arm_r.r[15] & ~1u;
+            uint32_t base = pc >= 8 ? pc - 8 : pc;
+            n += snprintf(buf + n, sizeof(buf) - n, "@%08lX:",
+                (unsigned long)base);
+            for (int j = 0; j < 32; j++) {
+                uint8_t b;
+                uint32_t a = base + j;
+                if (a < 0x4000)             b = bios[a];
+                else if ((a >> 24) == 2)    b = wram_board[a & ewram_mask];
+                else if ((a >> 24) == 3)    b = wram_chip[a & 0x7FFF];
+                else if ((a >> 24) >= 8 && (a >> 24) <= 0xB)
+                                            b = arm_readb(a);
+                else                        b = 0;
+                if (j == 8) n += snprintf(buf + n, sizeof(buf) - n, " >");
+                n += snprintf(buf + n, sizeof(buf) - n, " %02X", b);
+            }
+            n += snprintf(buf + n, sizeof(buf) - n, "\n");
+
+            // Sparse PC trace from this frame (every 4096th instruction).
+            extern uint32_t arm_pc_trace[16], arm_pc_trace_pos;
+            extern volatile uint32_t arm_undef_count;
+            extern volatile uint32_t arm_undef_first_pc;
+            extern volatile uint32_t arm_undef_first_op;
+            extern volatile uint32_t arm_first_low_pc;
+            extern volatile uint32_t arm_first_low_lr;
+            extern volatile uint32_t arm_first_low_op;
+            extern volatile uint8_t  arm_first_low_was_thumb;
+            extern volatile uint32_t arm_swi_count[256];
+            extern volatile uint8_t  arm_swi_last;
+
+            // Read what BIOS will fetch as the user IRQ handler address.
+            // The BIOS at 0x134 does LDR pc,[0x03FFFFFC], and that mirrors
+            // wram_chip[0x7FFC..0x7FFF] (IWRAM, 32 KB masked).
+            uint32_t user_irq_handler =
+                ((uint32_t)wram_chip[0x7FFC]) |
+                ((uint32_t)wram_chip[0x7FFD] << 8) |
+                ((uint32_t)wram_chip[0x7FFE] << 16) |
+                ((uint32_t)wram_chip[0x7FFF] << 24);
+            n += snprintf(buf + n, sizeof(buf) - n,
+                "*(0x03007FFC) = %08lX  (cart user IRQ handler)\n",
+                (unsigned long)user_irq_handler);
+
+            n += snprintf(buf + n, sizeof(buf) - n,
+                "undef=%lu  1st-low PC=%08lX LR=%08lX op=%08lX thumb=%d\n"
+                "SWI last=%02X counts: 01=%lu 02=%lu 04=%lu 05=%lu 06=%lu "
+                "0B=%lu 0C=%lu\n",
+                (unsigned long)arm_undef_count,
+                (unsigned long)arm_first_low_pc,
+                (unsigned long)arm_first_low_lr,
+                (unsigned long)arm_first_low_op,
+                (int)arm_first_low_was_thumb,
+                (unsigned)arm_swi_last,
+                (unsigned long)arm_swi_count[0x01],
+                (unsigned long)arm_swi_count[0x02],
+                (unsigned long)arm_swi_count[0x04],
+                (unsigned long)arm_swi_count[0x05],
+                (unsigned long)arm_swi_count[0x06],
+                (unsigned long)arm_swi_count[0x0B],
+                (unsigned long)arm_swi_count[0x0C]);
+            n += snprintf(buf + n, sizeof(buf) - n, "PC trace (newest last):\n");
+            uint32_t start = arm_pc_trace_pos > 16
+                ? arm_pc_trace_pos - 16 : 0;
+            for (uint32_t k = start; k < arm_pc_trace_pos; k++) {
+                n += snprintf(buf + n, sizeof(buf) - n, " %08lX",
+                    (unsigned long)arm_pc_trace[k & 15]);
+                if ((k - start) % 4 == 3)
+                    n += snprintf(buf + n, sizeof(buf) - n, "\n");
+            }
+            n += snprintf(buf + n, sizeof(buf) - n, "\n\n");
+
+            FILE *log = fopen("fxgba_log.txt", "a");
+            if (log) {
+                fwrite(buf, 1, n, log);
+                fclose(log);
+                dumps_done++;
+            }
+        }
+    }
+
+    // Clean up ROM buffer resources
+    rom_buffer_cleanup(&rom_buffer);
+    
+    gint_gba_uninit();
+    arm_uninit();
+
+    return 1;
+}
