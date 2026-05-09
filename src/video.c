@@ -31,6 +31,65 @@ void *screen;
 static const uint8_t x_tiles_lut[16] = { 1, 2, 4, 8, 2, 4, 4, 8, 1, 1, 2, 4, 0, 0, 0, 0 };
 static const uint8_t y_tiles_lut[16] = { 1, 2, 4, 8, 1, 1, 2, 4, 2, 4, 4, 8, 0, 0, 0, 0 };
 
+// Per-pixel BG/OBJ enable mask for the current scanline.
+//   bit 0 = BG0 visible
+//   bit 1 = BG1 visible
+//   bit 2 = BG2 visible
+//   bit 3 = BG3 visible
+//   bit 4 = OBJ visible
+// When no windows are enabled, every pixel gets 0x1f (everything DISPCNT
+// permits is visible). With WIN0/WIN1 active, we filter per-pixel using
+// WININ inside the window region and WINOUT elsewhere.
+//
+// The OBJ window (DISPCNT bit 15) is not yet implemented — it would need
+// a pre-render pass to mark sprite-touching pixels — so games using only
+// it will still render their OBJs everywhere.
+static uint8_t layer_mask[240];
+
+static void compute_layer_mask(void) {
+    bool win0_on    = (disp_cnt.w >> 13) & 1;
+    bool win1_on    = (disp_cnt.w >> 14) & 1;
+    bool objwin_on  = (disp_cnt.w >> 15) & 1;
+
+    if (!win0_on && !win1_on && !objwin_on) {
+        // Fast path: no windows. Everything DISPCNT enables is visible.
+        for (int x = 0; x < 240; x++) layer_mask[x] = 0x1f;
+        return;
+    }
+
+    // Default for any pixel not covered by an active window.
+    uint8_t outside_mask = win_out.b.b0 & 0x1f;
+    for (int x = 0; x < 240; x++) layer_mask[x] = outside_mask;
+
+    // WIN1 first (lower priority — WIN0 overrides if both cover a pixel).
+    if (win1_on) {
+        uint8_t y1 = win1_v.b.b1;       // top
+        uint16_t y2 = win1_v.b.b0;      // bottom (exclusive)
+        if (y2 > 160 || y1 > y2) y2 = 160;
+        if (v_count.w >= y1 && v_count.w < y2) {
+            uint8_t in_mask = win_in.b.b1 & 0x1f;
+            uint8_t  x1 = win1_h.b.b1;
+            uint16_t x2 = win1_h.b.b0;
+            if (x2 > 240 || x1 > x2) x2 = 240;
+            for (int x = x1; x < x2; x++) layer_mask[x] = in_mask;
+        }
+    }
+
+    // WIN0 second (higher priority).
+    if (win0_on) {
+        uint8_t y1 = win0_v.b.b1;
+        uint16_t y2 = win0_v.b.b0;
+        if (y2 > 160 || y1 > y2) y2 = 160;
+        if (v_count.w >= y1 && v_count.w < y2) {
+            uint8_t in_mask = win_in.b.b0 & 0x1f;
+            uint8_t  x1 = win0_h.b.b1;
+            uint16_t x2 = win0_h.b.b0;
+            if (x2 > 240 || x1 > x2) x2 = 240;
+            for (int x = x1; x < x2; x++) layer_mask[x] = in_mask;
+        }
+    }
+}
+
 static void render_obj(uint8_t prio) {
     if (!(disp_cnt.w & OBJ_ENB)) return;
 
@@ -151,7 +210,8 @@ static void render_obj(uint8_t prio) {
                     uint8_t  *src = vram + chr_addr;
 
                     for (uint8_t i = 0; i < run; i++) {
-                        if (obj_x + px + i < 0) continue;  // off-screen left
+                        int16_t sx = obj_x + px + i;
+                        if (sx < 0) continue;  // off-screen left
 
                         uint8_t cx = (pa > 0) ? (chr_x + i) : (chr_x - i);
 
@@ -159,7 +219,7 @@ static void render_obj(uint8_t prio) {
                             ? src[cx]
                             : ((src[cx >> 1] >> ((cx & 1) * 4)) & 0xf);
 
-                        if (pal_idx) {
+                        if (pal_idx && (layer_mask[sx] & 0x10)) {
                             uint32_t pal_addr = 0x100 | pal_idx | pal_base;
                             *(uint16_t *)((uint8_t *)screen + address + i * 2)
                                 = palette[pal_addr];
@@ -209,7 +269,8 @@ static void render_obj(uint8_t prio) {
 
                     uint32_t pal_addr = 0x100 | pal_idx | (!is_256 ? chr_pal * 16 : 0);
 
-                    if (pal_idx) *(uint16_t *)((uint8_t *)screen + address) = palette[pal_addr];
+                    if (pal_idx && (layer_mask[obj_x + x] & 0x10))
+                        *(uint16_t *)((uint8_t *)screen + address) = palette[pal_addr];
                 }
             }
         }
@@ -288,7 +349,8 @@ static void render_bg() {
 
                             uint16_t pal_idx = vram[vram_addr];
 
-                            if (pal_idx) *(uint16_t *)((uint8_t *)screen + address) = palette[pal_idx];
+                            if (pal_idx && (layer_mask[x] & (1 << bg_idx)))
+                                *(uint16_t *)((uint8_t *)screen + address) = palette[pal_idx];
                         }
                     } else {
                         // Tile-coherent non-affine render. Consecutive pixels
@@ -342,6 +404,7 @@ static void render_bg() {
                             uint8_t pixels = 8 - cx_start;
                             if (x + pixels > 240) pixels = 240 - x;
 
+                            uint8_t  bg_bit = 1 << bg_idx;
                             for (uint8_t i = 0; i < pixels; i++) {
                                 uint16_t cx = cx_start + i;
                                 if (flip_x) cx ^= 7;
@@ -354,7 +417,8 @@ static void render_bg() {
                                                >> (cx & 1) * 4) & 0xf;
                                 }
 
-                                if (pal_idx) {
+                                if (pal_idx
+                                    && (layer_mask[x + i] & bg_bit)) {
                                     *(uint16_t *)((uint8_t *)screen + address)
                                         = palette[pal_idx | pal_base];
                                 }
@@ -422,6 +486,8 @@ static void render_line() {
 
     uint16_t backdrop = palette[0];
     for (int i = 0; i < 240; i++) line[i] = backdrop;
+
+    compute_layer_mask();
 
     if ((disp_cnt.w & 7) > 2) {
         render_bg(0);

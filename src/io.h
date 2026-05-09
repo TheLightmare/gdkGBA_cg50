@@ -80,6 +80,11 @@ extern io_reg bg_refye[4];
 extern io_reg bg_refxi[4];
 extern io_reg bg_refyi[4];
 
+extern io_reg win0_h;
+extern io_reg win0_v;
+extern io_reg win1_h;
+extern io_reg win1_v;
+
 extern io_reg win_in;
 extern io_reg win_out;
 
