@@ -3,6 +3,7 @@
 #include <gint/keyboard.h>
 #include <gint/kmalloc.h>
 #include <gint/bfile.h>
+#include <gint/gint.h>
 
 #include "gint_gba.h"
 //===============
@@ -12,6 +13,7 @@
 
 #include "arm.h"
 #include "arm_mem.h"
+#include "bench.h"
 #include "rom_buffer.h"
 #include "extram.h"
 
@@ -62,7 +64,22 @@ static uint32_t to_pow2(uint32_t val) {
     return val + 1;
 }
 
+// 20 KB backup buffer for gint's on-chip RAM save/restore on world switch.
+// We place hot interpreter state (arm_r, lazy flags, etc.) in XYRAM for
+// fast deterministic access; world switches (e.g. fopen during ROM chunk
+// load) would otherwise corrupt that state. With BACKUP mode gint copies
+// XYRAM/ILRAM into this buffer on switch-out and restores on switch-in.
+static uint8_t onchip_backup_buf[GINT_ONCHIP_BUFSIZE];
+
 int main(void) {
+    // Set up on-chip RAM backup BEFORE any code that might world-switch
+    // (file I/O during BIOS/ROM init, etc.). Must happen before any code
+    // uses XYRAM-placed globals.
+    gint_set_onchip_save_mode(GINT_ONCHIP_BACKUP, onchip_backup_buf);
+
+    // Reserve a TMU for free-running phase timing.
+    bench_init();
+
     // Probe and register the optional extram arena BEFORE any heap-heavy
     // initialisation. ewram_init() will then prefer extram over the BSS
     // fallback for the 256 KB EWRAM allocation.
@@ -333,9 +350,35 @@ int main(void) {
     bool run = true;
     uint32_t loop_frame = 0;
     int dumps_done = 0;
+    int spike_dumps = 0;
+    uint32_t last_spike_frame = 0;
+    // Steady-state runs ~90 ms/frame on Ptune4 F5; flag anything over 200 ms
+    // as a spike worth investigating. Cap spike snapshots aggressively and
+    // require a frame gap between captures: a fade animation generates one
+    // slow frame every 2 frames, so without gating we'd hammer the
+    // filesystem for many seconds and risk a crash (saw this once).
+    const uint32_t SPIKE_THRESHOLD_US = 200000;
+    const int MAX_SPIKE_DUMPS = 5;
+    const uint32_t SPIKE_MIN_GAP = 30;
 
     while (run) {
+        // Capture per-frame timing BEFORE run_frame so we can compute the
+        // single-frame deltas of each phase, regardless of when (and whether)
+        // the cumulative bench_*_ticks accumulators get reset by a snapshot.
+        uint32_t frame_t0 = bench_now();
+        uint64_t arm_at_start = bench_arm_exec_ticks;
+        uint64_t ren_at_start = bench_render_ticks;
+        uint64_t dup_at_start = bench_dupdate_ticks;
+        uint32_t slr_at_start = bench_mem_slow_read;
+        uint32_t slw_at_start = bench_mem_slow_write;
+        uint32_t cm_at_start  = bench_chunk_miss;
+
         run_frame();
+
+        // Per-frame elapsed in µs.
+        uint32_t frame_us = bench_freq_hz
+            ? (uint32_t)((uint64_t)bench_elapsed(frame_t0) * 1000000ULL / bench_freq_hz)
+            : 0;
 
         clearevents();
 
@@ -360,16 +403,46 @@ int main(void) {
 
         // Capture diagnostic snapshots into a single in-memory buffer first,
         // then dump in one fwrite. fprintf-by-piece in gint world has been
-        // crashing the calculator. Take 5 snapshots at frames 1, 5, 30, 60,
-        // 120 so we have data even if a later one panics the OS.
+        // crashing the calculator. Snapshots fire on a fixed schedule so we
+        // get coverage from boot through long-running steady state. Each one
+        // also reports per-frame deltas plus cumulative-since-last-snap.
+        //
+        // Additionally, any frame whose total time exceeds SPIKE_THRESHOLD_US
+        // triggers an extra "spike" snapshot, capped at MAX_SPIKE_DUMPS to
+        // avoid log spam if the slowdown is sustained.
         loop_frame++;
-        static const uint32_t snapshot_frames[5] = { 1, 5, 30, 60, 120 };
-        if (dumps_done < 5 && loop_frame == snapshot_frames[dumps_done]) {
-            char buf[1024];
+        static const uint32_t snapshot_frames[] = {
+            1, 5, 30, 60, 120, 240, 480, 900, 1500, 2400, 3600
+        };
+        const int SNAPSHOT_FRAMES_COUNT =
+            (int)(sizeof(snapshot_frames) / sizeof(snapshot_frames[0]));
+        bool is_scheduled = (dumps_done < SNAPSHOT_FRAMES_COUNT)
+                         && (loop_frame == snapshot_frames[dumps_done]);
+        // Skip spike detection during boot frames (frame 1 is naturally huge
+        // because of BIOS/cart init). Only flag spikes after we're settled,
+        // require a minimum gap since the last spike, and cap the total
+        // count — fade animations and other sustained slow phases generate
+        // many spikes in a row and we don't want to spam disk writes.
+        bool is_spike = !is_scheduled
+                     && (loop_frame > 60)
+                     && (frame_us > SPIKE_THRESHOLD_US)
+                     && (spike_dumps < MAX_SPIKE_DUMPS)
+                     && (loop_frame - last_spike_frame >= SPIKE_MIN_GAP);
+        if (is_scheduled || is_spike) {
+            char buf[1280];
             int n = 0;
-            n += snprintf(buf + n, sizeof(buf) - n,
-                "--- snap %d (frame %lu) ---\n",
-                dumps_done, (unsigned long)loop_frame);
+            arm_flags_to_cpsr();
+            if (is_spike) {
+                n += snprintf(buf + n, sizeof(buf) - n,
+                    "--- SPIKE %d (frame %lu, this frame=%lu us) ---\n",
+                    spike_dumps, (unsigned long)loop_frame,
+                    (unsigned long)frame_us);
+            } else {
+                n += snprintf(buf + n, sizeof(buf) - n,
+                    "--- snap %d (frame %lu, this frame=%lu us) ---\n",
+                    dumps_done, (unsigned long)loop_frame,
+                    (unsigned long)frame_us);
+            }
             n += snprintf(buf + n, sizeof(buf) - n,
                 "PC=%08lX CPSR=%08lX halt=%d\n",
                 (unsigned long)arm_r.r[15],
@@ -437,8 +510,8 @@ int main(void) {
 
             n += snprintf(buf + n, sizeof(buf) - n,
                 "undef=%lu  1st-low PC=%08lX LR=%08lX op=%08lX thumb=%d\n"
-                "SWI last=%02X counts: 01=%lu 02=%lu 04=%lu 05=%lu 06=%lu "
-                "0B=%lu 0C=%lu\n",
+                "SWI last=%02X 01=%lu 02=%lu 04=%lu 05=%lu 06=%lu "
+                "0B=%lu 0C=%lu 0E=%lu 0F=%lu 11=%lu 12=%lu 13=%lu 14=%lu 15=%lu\n",
                 (unsigned long)arm_undef_count,
                 (unsigned long)arm_first_low_pc,
                 (unsigned long)arm_first_low_lr,
@@ -451,7 +524,14 @@ int main(void) {
                 (unsigned long)arm_swi_count[0x05],
                 (unsigned long)arm_swi_count[0x06],
                 (unsigned long)arm_swi_count[0x0B],
-                (unsigned long)arm_swi_count[0x0C]);
+                (unsigned long)arm_swi_count[0x0C],
+                (unsigned long)arm_swi_count[0x0E],
+                (unsigned long)arm_swi_count[0x0F],
+                (unsigned long)arm_swi_count[0x11],
+                (unsigned long)arm_swi_count[0x12],
+                (unsigned long)arm_swi_count[0x13],
+                (unsigned long)arm_swi_count[0x14],
+                (unsigned long)arm_swi_count[0x15]);
             n += snprintf(buf + n, sizeof(buf) - n, "PC trace (newest last):\n");
             uint32_t start = arm_pc_trace_pos > 16
                 ? arm_pc_trace_pos - 16 : 0;
@@ -461,13 +541,84 @@ int main(void) {
                 if ((k - start) % 4 == 3)
                     n += snprintf(buf + n, sizeof(buf) - n, "\n");
             }
-            n += snprintf(buf + n, sizeof(buf) - n, "\n\n");
+            n += snprintf(buf + n, sizeof(buf) - n, "\n");
+
+            // Per-frame breakdown for THIS frame. Useful for spike snapshots
+            // (the whole point is to see what's slow on the spike frame),
+            // and provides a fresh datapoint on scheduled snapshots too.
+            uint32_t fa_us = bench_freq_hz
+                ? (uint32_t)(((bench_arm_exec_ticks - arm_at_start) * 1000000ULL) / bench_freq_hz)
+                : 0;
+            uint32_t fr_us = bench_freq_hz
+                ? (uint32_t)(((bench_render_ticks - ren_at_start) * 1000000ULL) / bench_freq_hz)
+                : 0;
+            uint32_t fd_us = bench_freq_hz
+                ? (uint32_t)(((bench_dupdate_ticks - dup_at_start) * 1000000ULL) / bench_freq_hz)
+                : 0;
+            uint32_t fslr = bench_mem_slow_read  - slr_at_start;
+            uint32_t fslw = bench_mem_slow_write - slw_at_start;
+            uint32_t fcm  = bench_chunk_miss     - cm_at_start;
+            n += snprintf(buf + n, sizeof(buf) - n,
+                "FRAME breakdown:\n"
+                "  arm_exec=%lu us  render=%lu us  dupdate=%lu us\n"
+                "  slow_read=%lu  slow_write=%lu  chunk_miss=%lu\n",
+                (unsigned long)fa_us, (unsigned long)fr_us,
+                (unsigned long)fd_us,
+                (unsigned long)fslr, (unsigned long)fslw,
+                (unsigned long)fcm);
+
+            // Cumulative-since-prev-scheduled-snapshot — only meaningful and
+            // only reset on scheduled snapshots. Spike snapshots leave the
+            // cumulative accumulators alone so the next scheduled snapshot
+            // still reports a clean delta.
+            if (is_scheduled) {
+                static uint32_t prev_snap_frame = 0;
+                uint32_t frames_in_span = loop_frame - prev_snap_frame;
+                if (frames_in_span == 0) frames_in_span = 1;
+                prev_snap_frame = loop_frame;
+
+                uint32_t arm_us = bench_freq_hz
+                    ? (uint32_t)((bench_arm_exec_ticks * 1000000ULL) / bench_freq_hz)
+                    : 0;
+                uint32_t ren_us = bench_freq_hz
+                    ? (uint32_t)((bench_render_ticks * 1000000ULL) / bench_freq_hz)
+                    : 0;
+                uint32_t dup_us = bench_freq_hz
+                    ? (uint32_t)((bench_dupdate_ticks * 1000000ULL) / bench_freq_hz)
+                    : 0;
+                n += snprintf(buf + n, sizeof(buf) - n,
+                    "BENCH (totals over %lu frames, freq=%lu Hz):\n"
+                    "  arm_exec=%lu us (%lu/frame)\n"
+                    "  render  =%lu us (%lu/frame)\n"
+                    "  dupdate =%lu us (%lu/frame)\n"
+                    "  slow_read=%lu  slow_write=%lu  chunk_miss=%lu\n",
+                    (unsigned long)frames_in_span,
+                    (unsigned long)bench_freq_hz,
+                    (unsigned long)arm_us, (unsigned long)(arm_us / frames_in_span),
+                    (unsigned long)ren_us, (unsigned long)(ren_us / frames_in_span),
+                    (unsigned long)dup_us, (unsigned long)(dup_us / frames_in_span),
+                    (unsigned long)bench_mem_slow_read,
+                    (unsigned long)bench_mem_slow_write,
+                    (unsigned long)bench_chunk_miss);
+                // Reset cumulative for next interval.
+                bench_arm_exec_ticks  = 0;
+                bench_render_ticks    = 0;
+                bench_dupdate_ticks   = 0;
+                bench_mem_slow_read   = 0;
+                bench_mem_slow_write  = 0;
+                bench_chunk_miss      = 0;
+            }
+            n += snprintf(buf + n, sizeof(buf) - n, "\n");
 
             FILE *log = fopen("fxgba_log.txt", "a");
             if (log) {
                 fwrite(buf, 1, n, log);
                 fclose(log);
-                dumps_done++;
+                if (is_scheduled) dumps_done++;
+                if (is_spike) {
+                    spike_dumps++;
+                    last_spike_frame = loop_frame;
+                }
             }
         }
     }

@@ -4,6 +4,7 @@
 #include <gint/gint.h>
 #include <gint/kmalloc.h>
 
+#include "bench.h"
 #include "extram.h"
 
 // Allocate a chunk buffer. Prefers the optional "extram" arena (3 MB on
@@ -115,6 +116,7 @@ static int get_chunk_for_address(RomBuffer* buffer, uint32_t address) {
     }
 
     // Chunk not found, replace the least recently used one
+    bench_chunk_miss++;
     if (!load_chunk(buffer, lru_chunk, chunk_address)) {
         return -1;  // Failed to load chunk
     }

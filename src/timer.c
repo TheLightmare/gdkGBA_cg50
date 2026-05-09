@@ -2,7 +2,6 @@
 
 #include "dma.h"
 #include "io.h"
-#include "sound.h"
 #include "timer.h"
 
 //EXTERN VARIABLES DECLARATION ===
@@ -40,19 +39,11 @@ void timers_clock(uint32_t cycles) {
         if ((overflow = (tmr[idx].count.w > 0xffff))) {
             tmr[idx].count.w = tmr[idx].reload.w + (tmr[idx].count.w - 0x10000);
 
-            if (((snd_pcm_vol.w >> 10) & 1) == idx) {
-                //DMA Sound A FIFO
-                fifo_a_load();
-
-                if (fifo_a_len <= 0x10) dma_transfer_gba_fifo(1);
-            }
-
-            if (((snd_pcm_vol.w >> 14) & 1) == idx) {
-                //DMA Sound B FIFO
-                fifo_b_load();
-
-                if (fifo_b_len <= 0x10) dma_transfer_gba_fifo(2);
-            }
+            // Sound DMA-FIFO triggers removed: this emulator has no audio
+            // backend and the per-timer-overflow fifo_a_load/fifo_b_load
+            // calls were a measurable cost (sound timers run at sample
+            // rates, ~32 kHz, multiplied by emulated frames). Audio is
+            // permanently disabled.
         }
 
         if ((tmr[idx].ctrl.w & TMR_IRQ) && overflow)

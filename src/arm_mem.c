@@ -1,7 +1,9 @@
 #include <stdlib.h>
 
+#include <gint/defs/attributes.h>
 #include "arm.h"
 #include "arm_mem.h"
+#include "bench.h"
 #include "io.h"
 #include "rom_buffer.h"
 #include "extram.h"
@@ -23,6 +25,8 @@ uint8_t *wram_board = wram_board_static;
 uint32_t ewram_size = 0x10000;
 uint32_t ewram_mask = 0xFFFF;
 
+static void arm_mem_pages_init(void);
+
 void ewram_init(void) {
     if (extram_available) {
         uint8_t *p = (uint8_t *)kmalloc(0x40000, "extram");
@@ -30,6 +34,7 @@ void ewram_init(void) {
             wram_board = p;
             ewram_size = 0x40000;
             ewram_mask = 0x3FFFF;
+            arm_mem_pages_init();
             return;
         }
     }
@@ -37,17 +42,82 @@ void ewram_init(void) {
     wram_board = wram_board_static;
     ewram_size = 0x10000;
     ewram_mask = 0xFFFF;
+    arm_mem_pages_init();
 }
 
 uint8_t wram_chip[0x00008000];
 uint8_t palette_ram[0x00000400];
 uint8_t vram[0x00018000];
+// OAM stays in main RAM. We tried GXRAM placement; it gave no measurable
+// improvement and may have slightly hurt (XYRAM 16-bit access has a small
+// penalty vs cached main RAM, and 1 KB OAM was already cache-resident).
 uint8_t oam[0x00000400];
-RomBuffer rom_buffer;
+// rom_buffer's chunk-cache state (last_chunk_address, last_chunk_idx, the
+// 32 chunk_addresses[], the chunk_buffers[] pointer array, etc.) is read
+// on every instruction fetch. Putting the struct in XYRAM means those
+// reads cost 0 bus transactions; the actual chunk DATA still lives in
+// main-RAM (the chunk buffers point to extram allocations, ~64 KB each).
+//
+// Struct size is ~308 bytes (FILE*, sizes, 32×ptr, 32×addr, 32×lru, etc.)
+// which fits comfortably in the remaining XYRAM budget.
+RomBuffer rom_buffer GXRAM;
+
+// Page tables placed in XYRAM: hit on every memory operation, and main RAM
+// reads cost a bus transaction (~117 MHz) while XYRAM reads run at CPU clock
+// (1 cycle, never evicted). Bus traffic dominates this emulator's runtime
+// since the user's diagnostic showed Ptune3 (CPU-only OC) does nothing while
+// Ptune4 F5 (CPU + bus OC) helps measurably.
+mem_page_t mem_read_pages[256] GXRAM;
+static mem_page_t mem_write_pages[256] GXRAM;
+
+// Populate mem_read_pages and mem_write_pages.
+//
+// READ entries: regions whose reads are a flat masked load from a host
+// buffer (EWRAM, IWRAM, PRAM, OAM). VRAM (0x06) is handled by an inline
+// branch in the read fast path because its mirroring rule needs more
+// than a single AND mask. ROM is left NULL because it goes through
+// rom_buffer's chunk cache. BIOS/IO/EEPROM/Flash stay NULL.
+//
+// WRITE entries: regions whose writes are a flat masked store. EWRAM,
+// IWRAM, OAM. PRAM is excluded because writes there must update the
+// RGB565 cache. VRAM is excluded because of the mirroring rule and
+// because byte-writes to BG-VRAM duplicate to halfword. Note OAM byte
+// writes are silently dropped on real hardware; arm_writeb checks for
+// OAM (region 7) before consulting the page table.
+//
+// Called from ewram_init() because wram_board / ewram_mask are only
+// finalized there.
+static void arm_mem_pages_init(void) {
+    for (int i = 0; i < 256; i++) {
+        mem_read_pages[i].base = NULL;
+        mem_read_pages[i].mask = 0;
+        mem_write_pages[i].base = NULL;
+        mem_write_pages[i].mask = 0;
+    }
+    mem_read_pages[0x02].base = wram_board;
+    mem_read_pages[0x02].mask = ewram_mask;
+    mem_read_pages[0x03].base = wram_chip;
+    mem_read_pages[0x03].mask = 0x7FFF;
+    mem_read_pages[0x05].base = palette_ram;
+    mem_read_pages[0x05].mask = 0x3FF;
+    mem_read_pages[0x07].base = oam;
+    mem_read_pages[0x07].mask = 0x3FF;
+
+    mem_write_pages[0x02].base = wram_board;
+    mem_write_pages[0x02].mask = ewram_mask;
+    mem_write_pages[0x03].base = wram_chip;
+    mem_write_pages[0x03].mask = 0x7FFF;
+    mem_write_pages[0x07].base = oam;
+    mem_write_pages[0x07].mask = 0x3FF;
+}
 uint8_t *eeprom;
 uint8_t *sram;
 uint8_t *flash;
 
+// RGB565 palette cache: read by render_line on every visible pixel. We
+// tried GXRAM placement — no measurable improvement, since 1 KB fits
+// trivially in the 16 KB OC and was already cache-resident. Stays in
+// main RAM.
 uint16_t palette[0x200];
 
 uint32_t bios_op;
@@ -239,7 +309,11 @@ static uint8_t arm_read_(uint32_t address, uint8_t offset) {
 
 #define IS_OPEN_BUS(a)  (((a) >> 28) || ((a) >= 0x00004000 && (a) < 0x02000000))
 
-uint8_t arm_readb(uint32_t address) {
+// Slow paths: the original switch-based implementation. Called only when
+// the page-table fast path can't serve the read (BIOS/IO/VRAM/ROM/Flash/
+// EEPROM, plus any unmapped region where open-bus behavior matters).
+uint8_t arm_readb_slow(uint32_t address) {
+    bench_mem_slow_read++;
     uint8_t value = arm_read_(address, 0);
 
     if (!(address & 0x08000000)) {
@@ -252,7 +326,8 @@ uint8_t arm_readb(uint32_t address) {
     return value;
 }
 
-uint32_t arm_readh(uint32_t address) {
+uint32_t arm_readh_slow(uint32_t address) {
+    bench_mem_slow_read++;
     uint32_t a = address & ~1;
     uint8_t  s = address &  1;
     uint32_t value;
@@ -280,7 +355,8 @@ uint32_t arm_readh(uint32_t address) {
     return ROR(value, s << 3);
 }
 
-uint32_t arm_read(uint32_t address) {
+uint32_t arm_read_slow(uint32_t address) {
+    bench_mem_slow_read++;
     uint32_t a = address & ~3;
     uint8_t  s = address &  3;
     uint32_t value;
@@ -306,6 +382,80 @@ uint32_t arm_read(uint32_t address) {
     }
 
     return ROR(value, s << 3);
+}
+
+// Fast paths: page-table lookup for EWRAM/IWRAM/PRAM/OAM, plus an inlined
+// VRAM branch. The fast path has none of the open-bus / BIOS-leak
+// post-processing because those regions are guaranteed-real-memory:
+// IS_OPEN_BUS is false (region is in 2/3/5/6/7), the address has no
+// 0x08000000 bit, and we're not in BIOS. The only side effect we need to
+// preserve is `io_open_bus = 0` (the existing slow path's
+// `&= ((addr >> 24) == 4)` evaluates to 0 here).
+//
+// VRAM (0x06) is inlined rather than tabled because its mirroring rule
+// (96 KB visible window, with the 32 KB high half mirrored at 0x18000)
+// can't be expressed as a single AND mask.
+uint8_t arm_readb(uint32_t address) {
+    mem_page_t *p = &mem_read_pages[(address >> 24) & 0xFF];
+    if (p->base) {
+        io_open_bus = false;
+        return p->base[address & p->mask];
+    }
+    if ((address >> 24) == 0x06) {
+        uint32_t off = address & 0x1FFFF;
+        if (off & 0x10000) off &= 0x17FFF;
+        io_open_bus = false;
+        return vram[off];
+    }
+    return arm_readb_slow(address);
+}
+
+uint32_t arm_readh(uint32_t address) {
+    uint32_t a = address & ~1;
+    mem_page_t *p = &mem_read_pages[(a >> 24) & 0xFF];
+    if (p->base) {
+        io_open_bus = false;
+        const uint8_t *src = p->base + (a & p->mask);
+        uint32_t value = (uint32_t)src[0]
+                       | ((uint32_t)src[1] << 8);
+        return ROR(value, (address & 1) << 3);
+    }
+    if ((a >> 24) == 0x06) {
+        uint32_t off = a & 0x1FFFF;
+        if (off & 0x10000) off &= 0x17FFF;
+        io_open_bus = false;
+        const uint8_t *src = vram + off;
+        uint32_t value = (uint32_t)src[0]
+                       | ((uint32_t)src[1] << 8);
+        return ROR(value, (address & 1) << 3);
+    }
+    return arm_readh_slow(address);
+}
+
+uint32_t arm_read(uint32_t address) {
+    uint32_t a = address & ~3;
+    mem_page_t *p = &mem_read_pages[(a >> 24) & 0xFF];
+    if (p->base) {
+        io_open_bus = false;
+        const uint8_t *src = p->base + (a & p->mask);
+        uint32_t value = (uint32_t)src[0]
+                       | ((uint32_t)src[1] <<  8)
+                       | ((uint32_t)src[2] << 16)
+                       | ((uint32_t)src[3] << 24);
+        return ROR(value, (address & 3) << 3);
+    }
+    if ((a >> 24) == 0x06) {
+        uint32_t off = a & 0x1FFFF;
+        if (off & 0x10000) off &= 0x17FFF;
+        io_open_bus = false;
+        const uint8_t *src = vram + off;
+        uint32_t value = (uint32_t)src[0]
+                       | ((uint32_t)src[1] <<  8)
+                       | ((uint32_t)src[2] << 16)
+                       | ((uint32_t)src[3] << 24);
+        return ROR(value, (address & 3) << 3);
+    }
+    return arm_read_slow(address);
 }
 
 uint8_t arm_readb_n(uint32_t address) {
@@ -494,6 +644,7 @@ static void flash_write(uint32_t address, uint8_t value) {
 }
 
 static void arm_write_(uint32_t address, uint8_t offset, uint8_t value) {
+    bench_mem_slow_write++;
     switch (address >> 24) {
         case 0x2: wram_write(address, value); break;
         case 0x3: iwram_write(address, value); break;
@@ -515,8 +666,31 @@ static void arm_write_(uint32_t address, uint8_t offset, uint8_t value) {
 void arm_writeb(uint32_t address, uint8_t value) {
     uint8_t ah = address >> 24;
 
-    if (ah == 7) return; //OAM doesn't supposrt 8 bits writes
+    // OAM (region 7) silently drops 8-bit writes on real hardware.
+    if (ah == 7) return;
 
+    // Fast path: EWRAM/IWRAM byte writes are a flat masked store with no
+    // side effects.
+    mem_page_t *p = &mem_write_pages[ah];
+    if (p->base) {
+        p->base[address & p->mask] = value;
+        return;
+    }
+
+    // OBJ VRAM also drops 8-bit writes: in modes 0-2 the OBJ tile area
+    // starts at 0x06010000; in modes 3-5 it starts at 0x06014000.
+    // Conservative test below covers both: any byte-write past the BG
+    // VRAM area in mode-0..2 is dropped. (Mode 3-5 split is at 0x14000;
+    // current_mode is small and rarely toggled at runtime so this
+    // approximation works for typical games.)
+    if (ah == 6) {
+        uint32_t mode = disp_cnt.w & 7;
+        uint32_t obj_base = (mode >= 3) ? 0x14000 : 0x10000;
+        if ((address & 0x1ffff) >= obj_base) return;
+    }
+
+    // BG VRAM and palette duplicate the byte to a halfword (real GBA
+    // behaviour for those regions).
     if (ah > 4 && ah < 8) {
         arm_write_(address + 0, 0, value);
         arm_write_(address + 1, 1, value);
@@ -528,12 +702,89 @@ void arm_writeb(uint32_t address, uint8_t value) {
 void arm_writeh(uint32_t address, uint16_t value) {
     uint32_t a = address & ~1;
 
+    // Fast path: EWRAM/IWRAM/OAM halfword writes are two contiguous byte
+    // stores into a host buffer.
+    mem_page_t *p = &mem_write_pages[(a >> 24) & 0xFF];
+    if (p->base) {
+        uint8_t *dst = p->base + (a & p->mask);
+        dst[0] = (uint8_t)(value >> 0);
+        dst[1] = (uint8_t)(value >> 8);
+        return;
+    }
+    // VRAM (0x06): halfword writes don't have the byte-duplicate quirk;
+    // only the mirroring rule applies. Two-byte aligned writes share the
+    // same mirror-fold result.
+    if ((a >> 24) == 0x06) {
+        uint32_t off = a & 0x1FFFF;
+        if (off & 0x10000) off &= 0x17FFF;
+        vram[off + 0] = (uint8_t)(value >> 0);
+        vram[off + 1] = (uint8_t)(value >> 8);
+        return;
+    }
+    // PRAM (0x05): inline the BGR555->RGB565 conversion. The slow path
+    // calls pram_write twice (once per byte), each call re-reads
+    // palette_ram and re-computes the pixel. Inlining lets us compute the
+    // RGB565 entry directly from `value`. Critical for fade scenes where
+    // games write all 512 palette entries per frame.
+    if ((a >> 24) == 0x05) {
+        uint32_t pa = a & 0x3FE;
+        palette_ram[pa + 0] = (uint8_t)(value >> 0);
+        palette_ram[pa + 1] = (uint8_t)(value >> 8);
+        uint32_t r = (value >>  0) & 0x1f;
+        uint32_t g = (value >>  5) & 0x1f;
+        uint32_t b = (value >> 10) & 0x1f;
+        palette[pa >> 1] = (r << 11) | (((g << 1) | (g >> 4)) << 5) | b;
+        return;
+    }
+
     arm_write_(a | 0, 0, (uint8_t)(value >> 0));
     arm_write_(a | 1, 1, (uint8_t)(value >> 8));
 }
 
 void arm_write(uint32_t address, uint32_t value) {
     uint32_t a = address & ~3;
+
+    // Fast path: EWRAM/IWRAM/OAM word writes are four contiguous byte
+    // stores into a host buffer.
+    mem_page_t *p = &mem_write_pages[(a >> 24) & 0xFF];
+    if (p->base) {
+        uint8_t *dst = p->base + (a & p->mask);
+        dst[0] = (uint8_t)(value >>  0);
+        dst[1] = (uint8_t)(value >>  8);
+        dst[2] = (uint8_t)(value >> 16);
+        dst[3] = (uint8_t)(value >> 24);
+        return;
+    }
+    // VRAM (0x06): word writes share the mirroring rule.
+    if ((a >> 24) == 0x06) {
+        uint32_t off = a & 0x1FFFF;
+        if (off & 0x10000) off &= 0x17FFF;
+        vram[off + 0] = (uint8_t)(value >>  0);
+        vram[off + 1] = (uint8_t)(value >>  8);
+        vram[off + 2] = (uint8_t)(value >> 16);
+        vram[off + 3] = (uint8_t)(value >> 24);
+        return;
+    }
+    // PRAM (0x05): one word write covers two palette entries. Inline both
+    // BGR555->RGB565 conversions — same motivation as the halfword fast path.
+    if ((a >> 24) == 0x05) {
+        uint32_t pa = a & 0x3FC;
+        uint16_t v0 = (uint16_t)(value >>  0);
+        uint16_t v1 = (uint16_t)(value >> 16);
+        palette_ram[pa + 0] = (uint8_t)(v0 >> 0);
+        palette_ram[pa + 1] = (uint8_t)(v0 >> 8);
+        palette_ram[pa + 2] = (uint8_t)(v1 >> 0);
+        palette_ram[pa + 3] = (uint8_t)(v1 >> 8);
+        uint32_t r0 = (v0 >>  0) & 0x1f;
+        uint32_t g0 = (v0 >>  5) & 0x1f;
+        uint32_t b0 = (v0 >> 10) & 0x1f;
+        uint32_t r1 = (v1 >>  0) & 0x1f;
+        uint32_t g1 = (v1 >>  5) & 0x1f;
+        uint32_t b1 = (v1 >> 10) & 0x1f;
+        palette[(pa >> 1) + 0] = (r0 << 11) | (((g0 << 1) | (g0 >> 4)) << 5) | b0;
+        palette[(pa >> 1) + 1] = (r1 << 11) | (((g1 << 1) | (g1 >> 4)) << 5) | b1;
+        return;
+    }
 
     arm_write_(a | 0, 0, (uint8_t)(value >>  0));
     arm_write_(a | 1, 1, (uint8_t)(value >>  8));

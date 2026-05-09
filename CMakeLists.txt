@@ -13,6 +13,7 @@ set(SOURCES
   src/main.c
   src/arm_mem.c
   src/arm.c
+  src/bench.c
   src/dma.c
   src/extram.c
   src/gint_gba.c
@@ -44,6 +45,15 @@ fxconv_declare_assets(${ASSETS} ${ASSETS_fx} ${ASSETS_cg} WITH_METADATA)
 add_executable(myaddin ${SOURCES} ${ASSETS} ${ASSETS_${FXSDK_PLATFORM}})
 target_compile_options(myaddin PRIVATE -Wall -Wextra -Os)
 target_link_libraries(myaddin Gint::Gint)
+
+# Link-time optimization: lets the linker inline across translation
+# units. Critical here because arm_read() in arm_mem.c calls
+# rom_buffer_read_32() in rom_buffer.c -- without -flto the call goes
+# through a real function call every memory access. With -flto GCC can
+# inline rom_buffer_read_32's hot path (cache-hit + byte assembly)
+# directly into arm_read, saving the call overhead per LDR/STR.
+target_compile_options(myaddin PRIVATE -flto)
+target_link_options(myaddin PRIVATE -flto)
 
 # Hot files: ARM/Thumb interpreter, ROM fetch, IO bus, renderer, DMA
 # and timer (called per scanline / per memory access). Replace the

@@ -3,7 +3,6 @@
 
 #include "dma.h"
 #include "io.h"
-#include "sound.h"
 
 //EXTERN VARIABLES DECLARATION ===
 
@@ -75,27 +74,10 @@ void dma_transfer_gba(dma_timing_e timing) {
     }
 }
 
+// Sound DMA-FIFO transfer was the cart->APU pipe for digital audio.
+// With audio permanently disabled, the function is a no-op kept around
+// only so existing callers in this TU still link. timer.c no longer
+// invokes it either, so in practice it's never called.
 void dma_transfer_gba_fifo(uint8_t ch) {
-    if (!(dma_ch[ch].ctrl.w & DMA_ENB) ||
-        ((dma_ch[ch].ctrl.w >> 12) & 3) != SPECIAL)
-        return;
-
-    uint8_t i;
-
-    for (i = 0; i < 4; i++) {
-        arm_write(dma_dst_addr[ch], arm_read(dma_src_addr[ch]));
-
-        if (ch == 1)
-            fifo_a_copy();
-        else
-            fifo_b_copy();
-
-        switch ((dma_ch[ch].ctrl.w >> 7) & 3) {
-            case 0: dma_src_addr[ch] += 4; break;
-            case 1: dma_src_addr[ch] -= 4; break;
-        }
-    }
-
-    if (dma_ch[ch].ctrl.w & DMA_IRQ)
-        trigger_irq(DMA0_FLAG << ch);
+    (void)ch;
 }

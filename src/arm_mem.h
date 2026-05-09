@@ -47,6 +47,22 @@ void mem_write_8(uint32_t address, uint8_t value);
 void mem_write_16(uint32_t address, uint16_t value);
 void mem_write_32(uint32_t address, uint32_t value);
 
+// Page table for the read fast path. One entry per 16MB region (top byte of
+// the address). base==NULL means "fall through to the slow path"; otherwise
+// the byte at `base[addr & mask]` is the read result. Built once at boot by
+// arm_mem_pages_init() (called from ewram_init).
+typedef struct {
+    uint8_t  *base;
+    uint32_t  mask;
+} mem_page_t;
+
+extern mem_page_t mem_read_pages[256];
+
+// Slow paths exposed so the inline fast-path branches can tail-call them.
+uint8_t  arm_readb_slow(uint32_t address);
+uint32_t arm_readh_slow(uint32_t address);
+uint32_t arm_read_slow(uint32_t address);
+
 // Define access_type_e and constants
 typedef enum {
     SEQUENTIAL,

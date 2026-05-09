@@ -144,4 +144,8 @@ void arm_check_irq();
 
 void arm_reset();
 
+// Pack lazy NZCV into cpsr's top nibble. Call before reading arm_r.cpsr from
+// outside the ARM core (e.g., diagnostic dumps) to see up-to-date flags.
+void arm_flags_to_cpsr(void);
+
 #endif

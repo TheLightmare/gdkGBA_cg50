@@ -1,5 +1,6 @@
 #include "arm.h"
 #include "arm_mem.h"
+#include "bench.h"
 
 #include "dma.h"
 #include "io.h"
@@ -119,42 +120,97 @@ static void render_obj(uint8_t prio) {
 
             uint32_t address = surf_addr + obj_x * 2;
 
-            for (x = 0; x < rcx * 2;
-                x++,
-                ox += pa,
-                oy += pc,
-                address += 2) {
-                if (obj_x + x < 0) continue;
-                if (obj_x + x >= 240) break;
-
-                uint32_t vram_addr;
-                uint32_t pal_idx;
-
-                uint16_t tile_x = ox >> 11;
+            if (!affine) {
+                // Non-affine fast path: oy is constant across this scanline,
+                // and ox steps linearly by ±256 per pixel (pa = +0x100 or
+                // -0x100 for flip_x). tile_y, chr_y, and the per-tile
+                // chr_addr are constant for runs of 8 pixels in the same
+                // tile. Hoist that work out of the per-pixel loop —
+                // mirrors the BG tile-coherent restructure.
                 uint16_t tile_y = oy >> 11;
+                uint16_t chr_y  = (oy >> 8) & 7;
+                int32_t  total  = rcx * 2;  // sprite width in pixels
+                int32_t  px     = 0;
 
-                if (ox < 0 || tile_x >= x_tiles) continue;
-                if (oy < 0 || tile_y >= y_tiles) continue;
+                while (px < total) {
+                    if (obj_x + px >= 240) break;
 
-                uint16_t chr_x = (ox >> 8) & 7;
-                uint16_t chr_y = (oy >> 8) & 7;
+                    uint16_t tile_x = ox >> 11;
+                    uint16_t chr_x  = (ox >> 8) & 7;
 
-                uint32_t chr_addr =
-                    chr_base       +
-                    tile_y   * tys +
-                    chr_y    * lsz;
+                    uint32_t chr_addr = chr_base + tile_y * tys + chr_y * lsz;
+                    chr_addr += is_256 ? tile_x * 64 : tile_x * 32;
 
-                if (is_256) {
-                    vram_addr = chr_addr + tile_x * 64 + chr_x;
-                    pal_idx   = vram[vram_addr];
-                } else {
-                    vram_addr = chr_addr + tile_x * 32 + (chr_x >> 1);
-                    pal_idx   = (vram[vram_addr] >> (chr_x & 1) * 4) & 0xf;
+                    // Number of pixels until the chr_x walk exits this tile,
+                    // or until we hit a clip edge.
+                    uint8_t run = (pa > 0) ? (8 - chr_x) : (chr_x + 1);
+                    if (px + run > total) run = total - px;
+                    if (obj_x + px + run > 240) run = 240 - (obj_x + px);
+
+                    uint32_t pal_base = !is_256 ? chr_pal * 16 : 0;
+                    uint8_t  *src = vram + chr_addr;
+
+                    for (uint8_t i = 0; i < run; i++) {
+                        if (obj_x + px + i < 0) continue;  // off-screen left
+
+                        uint8_t cx = (pa > 0) ? (chr_x + i) : (chr_x - i);
+
+                        uint8_t pal_idx = is_256
+                            ? src[cx]
+                            : ((src[cx >> 1] >> ((cx & 1) * 4)) & 0xf);
+
+                        if (pal_idx) {
+                            uint32_t pal_addr = 0x100 | pal_idx | pal_base;
+                            *(uint16_t *)((uint8_t *)screen + address + i * 2)
+                                = palette[pal_addr];
+                        }
+                    }
+
+                    px      += run;
+                    ox      += (int32_t)pa * run;
+                    address += run * 2;
                 }
+            } else {
+                // Affine sprites: ox/oy advance by pa/pc/pb/pd per pixel
+                // and don't have linear tile coherence, so keep the
+                // per-pixel loop.
+                for (x = 0; x < rcx * 2;
+                    x++,
+                    ox += pa,
+                    oy += pc,
+                    address += 2) {
+                    if (obj_x + x < 0) continue;
+                    if (obj_x + x >= 240) break;
 
-                uint32_t pal_addr = 0x100 | pal_idx | (!is_256 ? chr_pal * 16 : 0);
+                    uint32_t vram_addr;
+                    uint32_t pal_idx;
 
-                if (pal_idx) *(uint16_t *)((uint8_t *)screen + address) = palette[pal_addr];
+                    uint16_t tile_x = ox >> 11;
+                    uint16_t tile_y = oy >> 11;
+
+                    if (ox < 0 || tile_x >= x_tiles) continue;
+                    if (oy < 0 || tile_y >= y_tiles) continue;
+
+                    uint16_t chr_x = (ox >> 8) & 7;
+                    uint16_t chr_y = (oy >> 8) & 7;
+
+                    uint32_t chr_addr =
+                        chr_base       +
+                        tile_y   * tys +
+                        chr_y    * lsz;
+
+                    if (is_256) {
+                        vram_addr = chr_addr + tile_x * 64 + chr_x;
+                        pal_idx   = vram[vram_addr];
+                    } else {
+                        vram_addr = chr_addr + tile_x * 32 + (chr_x >> 1);
+                        pal_idx   = (vram[vram_addr] >> (chr_x & 1) * 4) & 0xf;
+                    }
+
+                    uint32_t pal_addr = 0x100 | pal_idx | (!is_256 ? chr_pal * 16 : 0);
+
+                    if (pal_idx) *(uint16_t *)((uint8_t *)screen + address) = palette[pal_addr];
+                }
             }
         }
     }
@@ -235,58 +291,78 @@ static void render_bg() {
                             if (pal_idx) *(uint16_t *)((uint8_t *)screen + address) = palette[pal_idx];
                         }
                     } else {
-                        uint16_t oy     = v_count.w + bg[bg_idx].yofs.w;
-                        uint16_t tmy    = oy >> 3;
-                        uint16_t scrn_y = (tmy >> 5) & 1;
+                        // Tile-coherent non-affine render. Consecutive pixels
+                        // along a scanline almost always share a tile; we
+                        // read the tilemap entry and unpack tile metadata
+                        // (chr_numb, flip flags, palette select) ONCE per
+                        // tile (8 pixels) instead of per pixel. Cuts the
+                        // per-pixel work from ~30 SH4 ops to ~10.
+                        uint16_t oy          = v_count.w + bg[bg_idx].yofs.w;
+                        uint16_t tmy         = oy >> 3;
+                        uint16_t scrn_y      = (tmy >> 5) & 1;
+                        uint16_t base_chr_y  = oy & 7;
+                        uint32_t row_in_screen = (tmy & 0x1f) * 32 * 2;
 
-                        uint8_t x;
+                        uint8_t x = 0;
+                        uint16_t ox = bg[bg_idx].xofs.w;
 
-                        for (x = 0; x < 240; x++) {
-                            uint16_t ox     = x + bg[bg_idx].xofs.w;
-                            uint16_t tmx    = ox >> 3;
-                            uint16_t scrn_x = (tmx >> 5) & 1;
+                        while (x < 240) {
+                            // Per-tile setup: tilemap address, tile entry,
+                            // unpack flags, compute tile base in VRAM.
+                            uint16_t tmx_full = ox >> 3;
+                            uint16_t scrn_x   = (tmx_full >> 5) & 1;
+                            uint16_t cx_start = ox & 7;
 
-                            uint16_t chr_x = ox & 7;
-                            uint16_t chr_y = oy & 7;
-
-                            uint16_t pal_idx;
-                            uint16_t pal_base = 0;
-
-                            uint32_t map_addr = scrn_base + (tmy & 0x1f) * 32 * 2 + (tmx & 0x1f) * 2;
-
+                            uint32_t map_addr = scrn_base + row_in_screen
+                                              + (tmx_full & 0x1f) * 2;
                             switch (scrn_size) {
                                 case 1: map_addr += scrn_x * 2048; break;
                                 case 2: map_addr += scrn_y * 2048; break;
-                                case 3: map_addr += scrn_x * 2048 + scrn_y * 4096; break;
+                                case 3: map_addr += scrn_x * 2048
+                                                 + scrn_y * 4096; break;
                             }
 
-                            uint16_t tile = vram[map_addr + 0] | (vram[map_addr + 1] << 8);
-
+                            uint16_t tile = vram[map_addr + 0]
+                                          | (vram[map_addr + 1] << 8);
                             uint16_t chr_numb = (tile >>  0) & 0x3ff;
                             bool     flip_x   = (tile >> 10) & 0x1;
                             bool     flip_y   = (tile >> 11) & 0x1;
                             uint8_t  chr_pal  = (tile >> 12) & 0xf;
 
-                            if (!is_256) pal_base = chr_pal * 16;
-
-                            if (flip_x) chr_x ^= 7;
+                            uint16_t chr_y = base_chr_y;
                             if (flip_y) chr_y ^= 7;
 
-                            uint32_t vram_addr;
+                            uint16_t pal_base = is_256 ? 0 : chr_pal * 16;
 
-                            if (is_256) {
-                                vram_addr = chr_base + chr_numb * 64 + chr_y * 8 + chr_x;
-                                pal_idx   = vram[vram_addr];
-                            } else {
-                                vram_addr = chr_base + chr_numb * 32 + chr_y * 4 + (chr_x >> 1);
-                                pal_idx   = (vram[vram_addr] >> (chr_x & 1) * 4) & 0xf;
+                            uint32_t tile_base = is_256
+                                ? chr_base + chr_numb * 64 + chr_y * 8
+                                : chr_base + chr_numb * 32 + chr_y * 4;
+
+                            // How many pixels of this tile fall on screen.
+                            uint8_t pixels = 8 - cx_start;
+                            if (x + pixels > 240) pixels = 240 - x;
+
+                            for (uint8_t i = 0; i < pixels; i++) {
+                                uint16_t cx = cx_start + i;
+                                if (flip_x) cx ^= 7;
+
+                                uint16_t pal_idx;
+                                if (is_256) {
+                                    pal_idx = vram[tile_base + cx];
+                                } else {
+                                    pal_idx = (vram[tile_base + (cx >> 1)]
+                                               >> (cx & 1) * 4) & 0xf;
+                                }
+
+                                if (pal_idx) {
+                                    *(uint16_t *)((uint8_t *)screen + address)
+                                        = palette[pal_idx | pal_base];
+                                }
+                                address += 2;
                             }
 
-                            uint32_t pal_addr = pal_idx | pal_base;
-
-                            if (pal_idx) *(uint16_t *)((uint8_t *)screen + address) = palette[pal_addr];
-
-                            address += 2;
+                            x  += pixels;
+                            ox += pixels;
                         }
                     }
                 }
@@ -414,17 +490,29 @@ void run_frame() {
             dma_transfer_gba(VBLANK);
         }
 
-        arm_exec(CYC_LINE_HBLK0);
+        {
+            uint32_t t0 = bench_now();
+            arm_exec(CYC_LINE_HBLK0);
+            bench_arm_exec_ticks += bench_elapsed(t0);
+        }
 
         //H-Blank start
         if (v_count.w < LINES_VISIBLE) {
-            if (render_this_frame) render_line();
+            if (render_this_frame) {
+                uint32_t t0 = bench_now();
+                render_line();
+                bench_render_ticks += bench_elapsed(t0);
+            }
             dma_transfer_gba(HBLANK);
         }
 
         hblank_start();
 
-        arm_exec(CYC_LINE_HBLK1);
+        {
+            uint32_t t0 = bench_now();
+            arm_exec(CYC_LINE_HBLK1);
+            bench_arm_exec_ticks += bench_elapsed(t0);
+        }
 
         // Sound is not piped to any output yet, and sound_clock() does
         // double-precision FP math per scanline that is very slow on the
@@ -463,6 +551,9 @@ void run_frame() {
         uint8_t b2 = arm_readb(pc + 2);
         uint8_t b3 = arm_readb(pc + 3);
 
+        // Pack lazy NZCV into cpsr so the dump shows current flags.
+        arm_flags_to_cpsr();
+
         dprint(2, 196, C_BLACK,
                "F:%lu PC:%08lX op:%02X%02X%02X%02X DISPCNT:%04X PAL0:%04X",
                (unsigned long)frame_count,
@@ -483,7 +574,11 @@ void run_frame() {
     }
 
     // gint_vram is the active framebuffer; just push it to the display.
-    dupdate();
+    {
+        uint32_t t0 = bench_now();
+        dupdate();
+        bench_dupdate_ticks += bench_elapsed(t0);
+    }
 
     // sound_buffer_wrap();   // see note above on sound_clock()
 }

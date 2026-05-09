@@ -1,6 +1,8 @@
 #include <stdlib.h>
 #include <string.h>  // Add this for memset
 
+#include <gint/defs/attributes.h>
+
 #include "arm.h"
 #include "arm_mem.h"
 #include "arm_shared.h"
@@ -10,14 +12,28 @@
 
 // EXTERN VARIABLES DECLARATION ===
 
-arm_regs_t arm_r;
+// Hot interpreter state placed in XYRAM (16 KB on-chip SRAM, 1-cycle
+// deterministic access regardless of cache state). Preserved across
+// gint_world_switch via the backup buffer set up in main(). Total
+// footprint: arm_r (~256B) + dispatch state (~36B) = ~292 bytes.
 
-uint32_t arm_op;
-uint32_t arm_pipe[2];
-uint32_t arm_cycles;
+arm_regs_t arm_r GXRAM;
 
-bool int_halt;
-bool pipe_reload;
+uint32_t arm_op GXRAM;
+uint32_t arm_pipe[2] GXRAM;
+uint32_t arm_cycles GXRAM;
+
+bool int_halt GXRAM;
+bool pipe_reload GXRAM;
+
+// Lazy NZCV. Authoritative inside the inner exec loop; cpsr's top nibble is
+// only synced at boundaries where guest code or the host can observe it
+// (SPSR save/restore, MSR/MRS, arm_int, diagnostic dumps).
+// Each holds 0 or 1.
+uint32_t arm_flag_n GXRAM;
+uint32_t arm_flag_z GXRAM;
+uint32_t arm_flag_c GXRAM;
+uint32_t arm_flag_v GXRAM;
 
 //=================================
 
@@ -30,6 +46,24 @@ static void arm_flag_set(uint32_t flag, bool cond) {
         arm_r.cpsr |= flag;
     else
         arm_r.cpsr &= ~flag;
+}
+
+// Pack lazy NZCV into cpsr. Call before any code reads cpsr's top nibble.
+void arm_flags_to_cpsr(void) {
+    uint32_t nzcv = (arm_flag_n << 31)
+                  | (arm_flag_z << 30)
+                  | (arm_flag_c << 29)
+                  | (arm_flag_v << 28);
+    arm_r.cpsr = (arm_r.cpsr & 0x0fffffff) | nzcv;
+}
+
+// Unpack cpsr's top nibble into lazy NZCV. Call after any write that may
+// have changed cpsr's top nibble (SPSR restore, MSR with mask covering top byte).
+static inline void arm_flags_from_cpsr(void) {
+    arm_flag_n = (arm_r.cpsr >> 31) & 1;
+    arm_flag_z = (arm_r.cpsr >> 30) & 1;
+    arm_flag_c = (arm_r.cpsr >> 29) & 1;
+    arm_flag_v = (arm_r.cpsr >> 28) & 1;
 }
 
 static void arm_bank_to_regs(int8_t mode) {
@@ -148,17 +182,17 @@ static void arm_mode_set(int8_t mode) {
     arm_bank_to_regs(mode);
 }
 
-static bool arm_flag_tst(uint32_t flag) {
+static inline bool arm_flag_tst(uint32_t flag) {
     return arm_r.cpsr & flag;
 }
 
-static bool arm_cond(int8_t cond) {
+static inline bool arm_cond(int8_t cond) {
     bool res;
 
-    bool n = arm_flag_tst(ARM_N);
-    bool z = arm_flag_tst(ARM_Z);
-    bool c = arm_flag_tst(ARM_C);
-    bool v = arm_flag_tst(ARM_V);
+    bool n = arm_flag_n;
+    bool z = arm_flag_z;
+    bool c = arm_flag_c;
+    bool v = arm_flag_v;
 
     switch (cond >> 1) {
         case 0: res = z; break;
@@ -207,38 +241,41 @@ static void arm_spsr_to_cpsr() {
 
     arm_regs_to_bank(curr);
     arm_bank_to_regs(mode);
+
+    // SPSR's NZCV just landed in cpsr; resync lazy fields.
+    arm_flags_from_cpsr();
 }
 
-static void arm_setn(uint32_t res) {
-    arm_flag_set(ARM_N, res & (1 << 31));
+static inline void arm_setn(uint32_t res) {
+    arm_flag_n = res >> 31;
 }
 
-static void arm_setn64(uint64_t res) {
-    arm_flag_set(ARM_N, res & (1ULL << 63));
+static inline void arm_setn64(uint64_t res) {
+    arm_flag_n = (uint32_t)(res >> 63);
 }
 
-static void arm_setz(uint32_t res) {
-    arm_flag_set(ARM_Z, res == 0);
+static inline void arm_setz(uint32_t res) {
+    arm_flag_z = (res == 0);
 }
 
-static void arm_setz64(uint64_t res) {
-    arm_flag_set(ARM_Z, res == 0);
+static inline void arm_setz64(uint64_t res) {
+    arm_flag_z = (res == 0);
 }
 
-static void arm_addc(uint64_t res) {
-    arm_flag_set(ARM_C, res > 0xffffffff);
+static inline void arm_addc(uint64_t res) {
+    arm_flag_c = (res > 0xffffffffULL);
 }
 
-static void arm_subc(uint64_t res) {
-    arm_flag_set(ARM_C, res < 0x100000000ULL);
+static inline void arm_subc(uint64_t res) {
+    arm_flag_c = (res < 0x100000000ULL);
 }
 
-static void arm_addv(uint32_t lhs, uint32_t rhs, uint32_t res) {
-    arm_flag_set(ARM_V, ~(lhs ^ rhs) & (lhs ^ res) & 0x80000000);
+static inline void arm_addv(uint32_t lhs, uint32_t rhs, uint32_t res) {
+    arm_flag_v = ((~(lhs ^ rhs) & (lhs ^ res)) >> 31) & 1;
 }
 
-static void arm_subv(uint32_t lhs, uint32_t rhs, uint32_t res) {
-    arm_flag_set(ARM_V, (lhs ^ rhs) & (lhs ^ res) & 0x80000000);
+static inline void arm_subv(uint32_t lhs, uint32_t rhs, uint32_t res) {
+    arm_flag_v = (((lhs ^ rhs) & (lhs ^ res)) >> 31) & 1;
 }
 
 static uint32_t arm_saturate(int64_t val, int32_t min, int32_t max, bool q) {
@@ -260,7 +297,7 @@ static uint32_t arm_ssatq(int64_t val) {
     return arm_saturate(val, 0x80000000, 0x7fffffff, true);
 }
 
-static bool arm_in_thumb() {
+static inline bool arm_in_thumb() {
     return arm_flag_tst(ARM_T);
 }
 
@@ -293,7 +330,7 @@ static uint16_t arm_fetchh(access_type_e at) {
             else
                 arm_cycles += ws_s_t16[0];
 
-            return rom_buffer_read_16(&rom_buffer, arm_r.r[15]);
+            return rom_buffer_read_16_fast(&rom_buffer, arm_r.r[15]);
 
         case 0xa:
         case 0xb:
@@ -302,7 +339,7 @@ static uint16_t arm_fetchh(access_type_e at) {
             else
                 arm_cycles += ws_s_t16[1];
 
-            return rom_buffer_read_16(&rom_buffer, arm_r.r[15]);
+            return rom_buffer_read_16_fast(&rom_buffer, arm_r.r[15]);
 
         case 0xc:
         case 0xd:
@@ -311,7 +348,7 @@ static uint16_t arm_fetchh(access_type_e at) {
             else
                 arm_cycles += ws_s_t16[2];
 
-            return rom_buffer_read_16(&rom_buffer, arm_r.r[15]);
+            return rom_buffer_read_16_fast(&rom_buffer, arm_r.r[15]);
 
         default:
             if (at == NON_SEQ)
@@ -336,7 +373,7 @@ static uint32_t arm_fetch(access_type_e at) {
             else
                 arm_cycles += ws_s_arm[0];
 
-            return rom_buffer_read_32(&rom_buffer, arm_r.r[15]);
+            return rom_buffer_read_32_fast(&rom_buffer, arm_r.r[15]);
 
         case 0xa:
         case 0xb:
@@ -345,7 +382,7 @@ static uint32_t arm_fetch(access_type_e at) {
             else
                 arm_cycles += ws_s_arm[1];
 
-            return rom_buffer_read_32(&rom_buffer, arm_r.r[15]);
+            return rom_buffer_read_32_fast(&rom_buffer, arm_r.r[15]);
 
         case 0xc:
         case 0xd:
@@ -354,7 +391,7 @@ static uint32_t arm_fetch(access_type_e at) {
             else
                 arm_cycles += ws_s_arm[2];
 
-            return rom_buffer_read_32(&rom_buffer, arm_r.r[15]);
+            return rom_buffer_read_32_fast(&rom_buffer, arm_r.r[15]);
 
         default:
             if (at == NON_SEQ)
@@ -473,7 +510,7 @@ typedef struct {
 #define ARM_ARITH_NO_REV   0
 #define ARM_ARITH_REVERSE  1
 
-static void arm_arith_set(arm_data_t op, uint64_t res, bool add) {
+static inline void arm_arith_set(arm_data_t op, uint64_t res, bool add) {
     if (op.rd == 15) {
         if (op.s) {
             arm_spsr_to_cpsr();
@@ -498,16 +535,16 @@ static void arm_arith_set(arm_data_t op, uint64_t res, bool add) {
     }
 }
 
-static void arm_arith_add(arm_data_t op, bool adc) {
+static inline void arm_arith_add(arm_data_t op, bool adc) {
     uint64_t res  = op.lhs + op.rhs;
-    if (adc) res += arm_flag_tst(ARM_C);
+    if (adc) res += arm_flag_c;
 
     arm_r.r[op.rd] = res;
 
     arm_arith_set(op, res, ARM_ARITH_ADD);
 }
 
-static void arm_arith_subtract(arm_data_t op, bool sbc, bool rev) {
+static inline void arm_arith_subtract(arm_data_t op, bool sbc, bool rev) {
     if (rev) {
         uint64_t tmp = op.lhs;
 
@@ -516,7 +553,7 @@ static void arm_arith_subtract(arm_data_t op, bool sbc, bool rev) {
     }
 
     uint64_t res  = op.lhs - op.rhs;
-    if (sbc) res -= !arm_flag_tst(ARM_C);
+    if (sbc) res -= !arm_flag_c;
 
     arm_r.r[op.rd] = res;
 
@@ -535,15 +572,15 @@ static void arm_arith_sbc(arm_data_t op) {
     arm_arith_subtract(op, ARM_ARITH_CARRY, ARM_ARITH_NO_REV);
 }
 
-static void arm_arith_sub(arm_data_t op) {
+static inline void arm_arith_sub(arm_data_t op) {
     arm_arith_subtract(op, ARM_ARITH_NO_C, ARM_ARITH_NO_REV);
 }
 
-static void arm_arith_cmn(arm_data_t op) {
+static inline void arm_arith_cmn(arm_data_t op) {
     arm_arith_set(op, op.lhs + op.rhs, ARM_ARITH_ADD);
 }
 
-static void arm_arith_cmp(arm_data_t op) {
+static inline void arm_arith_cmp(arm_data_t op) {
     arm_arith_set(op, op.lhs - op.rhs, ARM_ARITH_SUB);
 }
 
@@ -573,7 +610,7 @@ static void arm_logic_set(arm_data_t op, uint32_t res) {
         arm_setn(res);
         arm_setz(res);
 
-        arm_flag_set(ARM_C, op.cout);
+        arm_flag_c = op.cout;
     }
 }
 
@@ -614,7 +651,7 @@ static void arm_lsl(arm_data_t op) {
     uint64_t val = op.lhs;
     uint8_t sh = op.rhs;
 
-    bool c = arm_flag_tst(ARM_C);
+    bool c = arm_flag_c;
 
     op.rhs = val;
     op.cout = c;
@@ -636,7 +673,7 @@ static void arm_lsr(arm_data_t op) {
     uint64_t val = op.lhs;
     uint8_t sh = op.rhs;
 
-    bool c = arm_flag_tst(ARM_C);
+    bool c = arm_flag_c;
 
     op.rhs = val;
     op.cout = c;
@@ -658,7 +695,7 @@ static void arm_ror(arm_data_t op) {
     uint64_t val = op.lhs;
     uint8_t sh = op.rhs;
 
-    bool c = arm_flag_tst(ARM_C);
+    bool c = arm_flag_c;
 
     op.rhs = val;
     op.cout = c;
@@ -731,7 +768,7 @@ static arm_shifter_t arm_data_regi(uint8_t rm, uint8_t type, uint8_t imm) {
     arm_shifter_t out;
 
     out.val = arm_r.r[rm];
-    out.cout = arm_flag_tst(ARM_C);
+    out.cout = arm_flag_c;
 
     uint32_t m = out.val;
     uint8_t c = out.cout;
@@ -794,7 +831,7 @@ static arm_shifter_t arm_data_regr(uint8_t rm, uint8_t type, uint8_t rs) {
     arm_shifter_t out;
 
     out.val = arm_r.r[rm];
-    out.cout = arm_flag_tst(ARM_C);
+    out.cout = arm_flag_c;
 
     if (rm == 15) out.val += 4;
 
@@ -877,7 +914,7 @@ static arm_data_t t16_data_imm3_op() {
     return op;
 }
 
-static arm_data_t t16_data_imm8_op() {
+static inline arm_data_t t16_data_imm8_op() {
     uint8_t imm = (arm_op >> 0) & 0xff;
     uint8_t rdn = (arm_op >> 8) & 0x7;
 
@@ -1285,6 +1322,8 @@ static void arm_psr_to_reg(arm_psr_t op) {
     if (op.r) {
         arm_spsr_get(&arm_r.r[op.rd]);
     } else {
+        // MRS reads cpsr — make sure lazy NZCV is packed in first.
+        arm_flags_to_cpsr();
         if ((arm_r.cpsr & 0x1f) == ARM_USR)
             arm_r.r[op.rd] = arm_r.cpsr & USR_MASK;
         else
@@ -1326,6 +1365,9 @@ static void arm_reg_to_psr(arm_psr_t op) {
 
         arm_regs_to_bank(curr);
         arm_bank_to_regs(mode);
+
+        // MSR may have rewritten cpsr's NZCV bits; resync lazy fields.
+        arm_flags_from_cpsr();
 
         arm_check_irq();
     }
@@ -1970,7 +2012,7 @@ static void t16_add_imm3() {
     arm_arith_add(t16_data_imm3_op(), ARM_ARITH_NO_C);
 }
 
-static void t16_add_imm8() {
+static inline void t16_add_imm8() {
     arm_arith_add(t16_data_imm8_op(), ARM_ARITH_NO_C);
 }
 
@@ -2232,7 +2274,7 @@ static void arm_cmp_regr() {
     arm_arith_cmp(arm_data_regr_op());
 }
 
-static void t16_cmp_imm8() {
+static inline void t16_cmp_imm8() {
     arm_arith_cmp(t16_data_imm8_op());
 }
 
@@ -2436,7 +2478,7 @@ static void arm_mov_imm12() {
     arm_logic_set(op, op.rhs);
 }
 
-static void t16_mov_imm() {
+static inline void t16_mov_imm() {
     uint8_t imm = (arm_op >> 0) & 0xff;
     uint8_t rd  = (arm_op >> 8) & 0x7;
 
@@ -2837,7 +2879,7 @@ static void t16_sub_imm3() {
     arm_arith_sub(t16_data_imm3_op());
 }
 
-static void t16_sub_imm8() {
+static inline void t16_sub_imm8() {
     arm_arith_sub(t16_data_imm8_op());
 }
 
@@ -2922,21 +2964,163 @@ static void hle_register_ram_reset(void) {
     if (flags & 0x10) memset(oam,         0, sizeof(oam));
 }
 
+// LZ77 decompression. The replacement BIOS we ship with often has a
+// broken or missing implementation, which causes both slowdown (it runs
+// as emulated ARM code in BIOS) and corruption (output is garbage).
+// HLE'ing it bypasses the BIOS entirely.
+//
+// Format (per GBATEK):
+//   r0 = source pointer (must be 4-byte aligned for VRAM variant)
+//   r1 = destination pointer
+//   word at *r0 = (compression_type << 0) | (decompressed_size << 8)
+//                where compression_type = 0x10 (LZ77 marker)
+//   following bytes = compressed stream
+//
+// Compressed stream format:
+//   - 1 flags byte; each bit (MSB first) indicates the next item type
+//   - flag bit 0: literal byte follows
+//   - flag bit 1: back-reference (2 bytes follow)
+//       byte 1 high nibble = (length - 3), low nibble = displacement high
+//       byte 2          = displacement low (12-bit total displacement)
+//       length 3..18, displacement 1..4096
+//   - back-reference copies (length) bytes from (dst - displacement - 1)
+//
+// The VRAM variant differs only in that destination writes go through
+// arm_writeh in halfword pairs (VRAM doesn't accept 8-bit writes for
+// OBJ region, and the BIOS spec specifies halfword writes regardless).
+static void hle_lz77_uncomp(bool to_vram) {
+    uint32_t src = arm_r.r[0];
+    uint32_t dst = arm_r.r[1];
+
+    uint32_t header = arm_read(src);
+    src += 4;
+    uint32_t size = header >> 8;
+
+    uint32_t written = 0;
+    uint16_t pair = 0;       // halfword buffer for VRAM mode
+    int      pair_have = 0;  // 0 or 1 byte buffered
+
+    while (written < size) {
+        uint8_t flags = arm_readb(src++);
+
+        for (int i = 0; i < 8 && written < size; i++) {
+            uint8_t v;
+
+            if (flags & 0x80) {
+                // Back-reference: 2 bytes
+                uint8_t b1 = arm_readb(src++);
+                uint8_t b2 = arm_readb(src++);
+                uint32_t length = (b1 >> 4) + 3;
+                uint32_t disp   = (((uint32_t)b1 & 0xF) << 8) | b2;
+                disp += 1;
+
+                for (uint32_t k = 0; k < length && written < size; k++) {
+                    // Read previously-decompressed byte. For VRAM mode we
+                    // need to read what we wrote; the cart-side reads of
+                    // VRAM go through arm_readb which handles regions
+                    // correctly.
+                    v = arm_readb(dst - disp);
+
+                    if (to_vram) {
+                        if (pair_have) {
+                            pair |= (uint16_t)v << 8;
+                            arm_writeh(dst - 1, pair);
+                            pair = 0;
+                            pair_have = 0;
+                        } else {
+                            pair = v;
+                            pair_have = 1;
+                        }
+                    } else {
+                        arm_writeb(dst, v);
+                    }
+                    dst++;
+                    written++;
+                }
+            } else {
+                // Literal
+                v = arm_readb(src++);
+                if (to_vram) {
+                    if (pair_have) {
+                        pair |= (uint16_t)v << 8;
+                        arm_writeh(dst - 1, pair);
+                        pair = 0;
+                        pair_have = 0;
+                    } else {
+                        pair = v;
+                        pair_have = 1;
+                    }
+                } else {
+                    arm_writeb(dst, v);
+                }
+                dst++;
+                written++;
+            }
+
+            flags <<= 1;
+        }
+    }
+
+    // Flush trailing odd byte for VRAM mode
+    if (to_vram && pair_have) {
+        arm_writeh(dst - 1, pair);
+    }
+}
+
+static void hle_lz77_uncomp_wram(void) { hle_lz77_uncomp(false); }
+static void hle_lz77_uncomp_vram(void) { hle_lz77_uncomp(true);  }
+
 static void hle_halt(void) {
     int_halt = true;
 }
 
-// VBlankIntrWait / IntrWait: just halt and let the existing run-frame loop
-// fire the VBlank IRQ when it reaches v_count = 160. The cart's installed
-// IRQ handler (at *(0x03007FFC)) will run, ack IF, and the SWI's "next
-// instruction" will execute on resume. Real BIOS SWI 0x05 also sets up
-// BIOSIF flag bookkeeping; for the simple cart wait-loop pattern this
-// minimal HLE is sufficient. Saves a trip through the (broken) BIOS
-// dispatcher per frame.
-static void hle_intr_wait(void) {
+// VBlankIntrWait / IntrWait: emulate the relevant side effects of the
+// real BIOS implementation, then halt. The run-frame loop will fire the
+// cart's IRQ when it reaches v_count = 160 (or when the requested timer/
+// HBlank/VCount IRQ fires), the cart's installed IRQ handler at
+// *(0x03007FFC) runs and acks IF + sets BIOSIF, and execution resumes
+// past the SWI on return.
+//
+// Real BIOS SWI 0x05 specifically:
+//   1. IME = 1
+//   2. IE |= VBLANK
+//   3. loop: halt; if (BIOSIF & VBLANK) { BIOSIF &= ~VBLANK; return; }
+//
+// Real BIOS SWI 0x04 (IntrWait):
+//   r0 = discardOldFlags (if 1, clear BIOSIF before checking)
+//   r1 = irqMask (which IF bits to wait for)
+//   1. IME = 1
+//   2. IE |= r1
+//   3. if (r0) BIOSIF &= ~r1
+//   4. loop: halt; if (BIOSIF & r1) { BIOSIF &= ~matched; return; }
+//
+// Carts that call SWI 0x05 with IME/IE not pre-set (a few do, knowing
+// BIOS will enable them) would otherwise halt forever -- no IRQ can
+// fire to wake us. The IME/IE writes here fix that.
+static void hle_vblank_intr_wait(void) {
+    int_enb_m.w |= 1;          // IME = 1
+    int_enb.w   |= 0x0001;     // IE bit 0 = VBlank
+
+    // Clear BIOSIF VBlank flag at 0x03007FF8 bit 0. We can't loop-check
+    // it like real BIOS does (would need recursive arm_exec), but
+    // clearing it on entry mirrors the discardOldFlags=true behaviour
+    // that almost all callers want.
+    wram_chip[0x7FF8] &= ~0x01;
+
     int_halt = true;
 }
-static void hle_vblank_intr_wait(void) {
+
+static void hle_intr_wait(void) {
+    int_enb_m.w |= 1;
+    int_enb.w   |= (uint16_t)arm_r.r[1];   // enable requested IRQs
+
+    if (arm_r.r[0]) {
+        // discardOldFlags: clear matching BIOSIF bits.
+        uint16_t mask = (uint16_t)arm_r.r[1];
+        wram_chip[0x7FF8] &= ~(uint8_t)(mask & 0xFF);
+        wram_chip[0x7FF9] &= ~(uint8_t)(mask >> 8);
+    }
+
     int_halt = true;
 }
 
@@ -2951,6 +3135,8 @@ static bool hle_swi(uint8_t swi_num) {
         case 0x06: hle_div();                return true;
         case 0x0B: hle_cpu_set();            return true;
         case 0x0C: hle_cpu_fast_set();       return true;
+        case 0x11: hle_lz77_uncomp_wram();   return true;
+        case 0x12: hle_lz77_uncomp_vram();   return true;
         default: return false;
     }
 }
@@ -3080,7 +3266,11 @@ static void arm_proc_set(void (**arr)(), void (*proc)(), uint32_t op, uint32_t m
 }
 
 void (*arm_proc[2][4096])();
-void (*thumb_proc[2048])();
+// Thumb dispatch table in XYRAM: hit on every Thumb instruction, and Thumb
+// is the dominant mode in most GBA games. 2048 entries × 4 bytes = 8 KB,
+// fits comfortably in XYRAM (16 KB). Each lookup avoids a main-RAM bus
+// transaction (~117 MHz) on cache miss.
+void (*thumb_proc[2048])() GXRAM;
 
 static void arm_proc_init() {
     //Format 27:20,7:4
@@ -3323,29 +3513,43 @@ void arm_uninit() {
 
 #define ARM_COND_UNCOND  0b1111
 
-static void t16_inc_r15() {
+static inline void t16_inc_r15() {
     if (pipe_reload)
         pipe_reload = false;
     else
         arm_r.r[15] += 2;
 }
 
-static void t16_step() {
+static inline void t16_step() {
     arm_pipe[1] = arm_fetchh(SEQUENTIAL);
 
-    thumb_proc[arm_op >> 5]();
+    // Inline fast paths for the most common Thumb opcodes that can be
+    // identified by their top 5 bits alone. The handlers and their
+    // helpers (t16_data_imm8_op, arm_arith_*, etc.) are static inline,
+    // so the compiler folds them in here, eliminating the function-call
+    // overhead and indirect dispatch through thumb_proc[].
+    //
+    // Non-matching opcodes fall through to the existing function-pointer
+    // dispatch.
+    switch (arm_op >> 11) {
+        case 0b00100: t16_mov_imm();   break;  // MOV  Rd, #imm8
+        case 0b00101: t16_cmp_imm8();  break;  // CMP  Rd, #imm8
+        case 0b00110: t16_add_imm8();  break;  // ADD  Rd, #imm8
+        case 0b00111: t16_sub_imm8();  break;  // SUB  Rd, #imm8
+        default:      thumb_proc[arm_op >> 5]();
+    }
 
     t16_inc_r15();
 }
 
-static void arm_inc_r15() {
+static inline void arm_inc_r15() {
     if (pipe_reload)
         pipe_reload = false;
     else
         arm_r.r[15] += 4;
 }
 
-static void arm_step() {
+static inline void arm_step() {
     arm_pipe[1] = arm_fetch(SEQUENTIAL);
 
     uint32_t proc;
@@ -3353,12 +3557,19 @@ static void arm_step() {
     proc  = (arm_op >> 16) & 0xff0;
     proc |= (arm_op >>  4) & 0x00f;
 
-    int8_t cond = arm_op >> 28;
+    uint32_t cond = arm_op >> 28;
 
-    if (cond == ARM_COND_UNCOND)
-        arm_proc[1][proc]();
-    else if (arm_cond(cond))
+    // cond == 14 (AL = always) is by far the most common — most ARM code is
+    // unconditionally executed at the per-instruction granularity. Skip the
+    // arm_cond() call entirely for that case. cond == 15 is the
+    // "unconditional" form (a few instructions like BLX have this encoding).
+    if (cond == 14) {
         arm_proc[0][proc]();
+    } else if (cond == ARM_COND_UNCOND) {
+        arm_proc[1][proc]();
+    } else if (arm_cond(cond)) {
+        arm_proc[0][proc]();
+    }
 
     arm_inc_r15();
 }
@@ -3387,9 +3598,14 @@ void arm_exec(uint32_t target_cycles) {
         return;
     }
 
-    while (arm_cycles < target_cycles) {
-        uint32_t cycles = arm_cycles;
+    // Timer clocking is batched to once per arm_exec call instead of once
+    // per emulated instruction. Saves a load+test+sub+fn-call per inner
+    // iteration. Loss of granularity: timer overflows / IRQs that would
+    // have fired mid-scanline now fire at the end of the scanline. Most
+    // games tolerate this since they only check timers at VBlank anyway.
+    uint32_t start_cycles = arm_cycles;
 
+    while (arm_cycles < target_cycles) {
         arm_op      = arm_pipe[0];
         arm_pipe[0] = arm_pipe[1];
 
@@ -3410,14 +3626,15 @@ void arm_exec(uint32_t target_cycles) {
             arm_step();
 
         if (int_halt) arm_cycles = target_cycles;
-
-        if (tmr_enb) timers_clock(arm_cycles - cycles);
     }
 
+    if (tmr_enb) timers_clock(arm_cycles - start_cycles);
     arm_cycles -= target_cycles;
 }
 
 void arm_int(uint32_t address, int8_t mode) {
+    // Saving CPSR to SPSR: pack lazy NZCV first so the saved snapshot is correct.
+    arm_flags_to_cpsr();
     uint32_t cpsr = arm_r.cpsr;
 
     arm_mode_set(mode);

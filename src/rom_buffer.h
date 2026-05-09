@@ -5,21 +5,35 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Size of each ROM chunk in the buffer (e.g., 64KB)
-#define ROM_CHUNK_SIZE (64 * 1024)
-// Number of chunks to keep in memory at once. With the optional "extram"
-// arena registered (3 MB on CG-50 OS <= 03.06), we have plenty of room and
-// can cache enough cart code/data to nearly eliminate runtime chunk loads
-// for most games. 8 chunks = 512 KB cache, large enough to hold the cart's
-// hot code section plus a meaningful slice of its data tables.
+// Per-chunk size and chunk count. Total cache memory = SIZE × COUNT and
+// must fit in the extram budget (~2.75 MB free after the 256 KB EWRAM
+// allocation, on CG-50 with the standard OS).
 //
-// rom_buffer_init() prefers kmalloc(...,"extram") for the chunk buffers
-// when available and falls back to default malloc otherwise. If extram
-// isn't registered (e.g. newer OS), the fallback only has ~196 KB of
-// _uram free, so we'd want a smaller value. The malloc loop in
-// rom_buffer_init() degrades gracefully and reports how many chunks
-// actually allocated.
-#define ROM_BUFFER_CHUNKS 8
+// Tuning history:
+//   - 64 KB × 8 chunks (512 KB): heavy thrashing during Zelda init.
+//   - 64 KB × 32 chunks (2 MB): default for most prior testing.
+//   - 64 KB × 44 chunks (2.75 MB): no measurable improvement; benchmarks
+//     showed 939 chunk_miss across 240 frames in active gameplay,
+//     averaging ~4/frame.
+//   - 32 KB × 88 chunks (2.75 MB, current): same total cache but twice
+//     as many distinct ROM regions resident. For a 14 MB cart with
+//     spread-thin access (many small accesses across many regions, as
+//     opposed to one big sequential read), finer granularity reduces
+//     thrashing materially: a "miss" pulls only 32 KB instead of 64 KB,
+//     halving the per-miss fread time.
+//
+// rom_buffer_init() accepts partial allocation >= 2, so if extram is
+// tighter than expected we degrade gracefully to fewer chunks.
+//
+// Cost of more chunks:
+//   - get_chunk_for_address loops up to ROM_BUFFER_CHUNKS on a miss.
+//     The last-hit cache makes the hit path O(1), and even 88 iterations
+//     of compare-and-branch is negligible compared to the storage I/O
+//     a miss represents.
+//   - RomBuffer struct grows by ~9 bytes per chunk (ptr+addr+lru) — at
+//     88 chunks the struct is ~800 bytes, still trivially fits in XYRAM.
+#define ROM_CHUNK_SIZE     (32 * 1024)
+#define ROM_BUFFER_CHUNKS  88
 
 typedef struct {
     FILE* rom_file;           // File handle for the ROM
@@ -65,5 +79,42 @@ uint16_t rom_buffer_read_16(RomBuffer* buffer, uint32_t address);
 
 // Read a word (32 bits) from the ROM at the specified address
 uint32_t rom_buffer_read_32(RomBuffer* buffer, uint32_t address);
+
+// Inline fast-path variants for instruction fetch. Skip the function call
+// to rom_buffer_read_* and the inner get_chunk_for_address dispatch when
+// the access lands in the same chunk as the previous fetch — the
+// overwhelmingly common case in any game's hot loop.
+//
+// Caller invariant: address is aligned (2-byte for _16, 4-byte for _32).
+// Aligned reads in 64 KB chunks never span a chunk boundary so we don't
+// need the per-byte assembly that the slow path uses near boundaries.
+static inline uint16_t rom_buffer_read_16_fast(RomBuffer *buffer,
+                                               uint32_t address)
+{
+    if (__builtin_expect(
+            (address & ~(ROM_CHUNK_SIZE - 1)) == buffer->last_chunk_address &&
+            buffer->last_chunk_idx >= 0, 1)) {
+        const uint8_t *p = buffer->chunk_buffers[buffer->last_chunk_idx] +
+                           (address & (ROM_CHUNK_SIZE - 1));
+        return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+    }
+    return rom_buffer_read_16(buffer, address);
+}
+
+static inline uint32_t rom_buffer_read_32_fast(RomBuffer *buffer,
+                                               uint32_t address)
+{
+    if (__builtin_expect(
+            (address & ~(ROM_CHUNK_SIZE - 1)) == buffer->last_chunk_address &&
+            buffer->last_chunk_idx >= 0, 1)) {
+        const uint8_t *p = buffer->chunk_buffers[buffer->last_chunk_idx] +
+                           (address & (ROM_CHUNK_SIZE - 1));
+        return  (uint32_t)p[0]        |
+               ((uint32_t)p[1] <<  8) |
+               ((uint32_t)p[2] << 16) |
+               ((uint32_t)p[3] << 24);
+    }
+    return rom_buffer_read_32(buffer, address);
+}
 
 #endif // ROM_BUFFER_H
