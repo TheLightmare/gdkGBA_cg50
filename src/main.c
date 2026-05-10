@@ -14,6 +14,7 @@
 #include "arm.h"
 #include "arm_mem.h"
 #include "bench.h"
+#include "build_flags.h"
 #include "rom_buffer.h"
 #include "extram.h"
 
@@ -86,6 +87,7 @@ int main(void) {
     extram_init();
     ewram_init();
 
+#if GBA_DIAG_LOG
     dclear(C_WHITE);
     dtext (1, 20, C_BLACK, "gdkGBA - Gameboy Advance emulator made by gdkchan");
     dtext (1, 40, C_BLACK, "ported to fx-CG50 by Lightmare");
@@ -96,6 +98,7 @@ int main(void) {
     dupdate();
 
     getkey();
+#endif
 
     gint_gba_init();
     arm_init();
@@ -129,9 +132,11 @@ int main(void) {
     }
 
     size_t bios_read = fread(bios, 1, 16384, image);
+    (void)bios_read;
 
     fclose(image);
 
+#if GBA_DIAG_LOG
     // Print BIOS bytes at the addresses where the ARM core has been seen
     // looping (0x00, 0x18 = IRQ vector, 0x28, 0x2C). Word-decoded for ARM.
     dclear(C_WHITE);
@@ -150,6 +155,7 @@ int main(void) {
            bios[0x2C], bios[0x2D], bios[0x2E], bios[0x2F]);
     dupdate();
     getkey();
+#endif
 
     // Find the first .gba file in storage memory. Fall back to "test.gba"
     // so existing setups still work without renaming.
@@ -172,7 +178,7 @@ int main(void) {
         return 0;
     }
 
-    //DEBUG
+#if GBA_DIAG_LOG
     dclear(C_WHITE);
     dtext(1,  1, C_BLACK, "loading ROM image:");
     dprint(1, 20, C_BLACK, "%s", rom_path);
@@ -181,18 +187,18 @@ int main(void) {
         : "(fallback to test.gba)");
     dupdate();
     getkey();
-    //====
+#endif
 
     fseek(image, 0, SEEK_END);
 
     cart_rom_size = ftell(image);
 
-    //DEBUG
+#if GBA_DIAG_LOG
     dclear(C_WHITE);
     dprint(1, 1, C_BLACK, "cart_rom_size : %ld bytes", cart_rom_size);
     dupdate();
     getkey();
-    //====
+#endif
 
     cart_rom_mask = to_pow2(cart_rom_size) - 1;
 
@@ -238,7 +244,7 @@ int main(void) {
         return 0;
     }
 
-    //DEBUG
+#if GBA_DIAG_LOG
     dclear(C_WHITE);
     dtext (1,  1, C_BLACK, "Successfully initialized ROM buffer!");
     dprint(1, 20, C_BLACK, "active chunks: %d/%d  (each %d KB)",
@@ -246,11 +252,12 @@ int main(void) {
     dprint(1, 40, C_BLACK, "%s", extram_status);
     dupdate();
     getkey();
-    //====
+#endif
 
     arm_reset();
 
 
+#if GBA_DIAG_LOG
     // One-shot BIOS + cart dump to log file at boot.
     {
         FILE *log = fopen("fxgba_log.txt", "w");
@@ -316,11 +323,11 @@ int main(void) {
         }
     }
 
-    extern arm_regs_t arm_r;
-    extern bool int_halt;
-    extern volatile uint8_t arm_first_low_set;
-    arm_first_low_set = 0;  // Ignore the arm_reset path; only record real
-                            // mid-execution branches into BIOS region.
+    {
+        extern volatile uint8_t arm_first_low_set;
+        arm_first_low_set = 0;  // Ignore the arm_reset path; only record real
+                                // mid-execution branches into BIOS region.
+    }
 
     // After arm_reset the rom_buffer chunks are already populated (from the
     // first cart fetch). Dump a small bounded range around the address where
@@ -339,6 +346,7 @@ int main(void) {
             fclose(log);
         }
     }
+#endif // GBA_DIAG_LOG
 
     // Wipe gint_vram once before starting the emulation loop so leftover
     // boot-screen text outside the centered GBA viewport doesn't bleed
@@ -348,6 +356,7 @@ int main(void) {
     dupdate();
 
     bool run = true;
+#if GBA_DIAG_LOG
     uint32_t loop_frame = 0;
     int dumps_done = 0;
     int spike_dumps = 0;
@@ -364,8 +373,10 @@ int main(void) {
     const int MAX_SPIKE_DUMPS = 5;
     const uint32_t SPIKE_MIN_GAP = 30;
     const int MAX_MANUAL_DUMPS = 20;
+#endif
 
     while (run) {
+#if GBA_BENCH
         // Capture per-frame timing BEFORE run_frame so we can compute the
         // single-frame deltas of each phase, regardless of when (and whether)
         // the cumulative bench_*_ticks accumulators get reset by a snapshot.
@@ -376,16 +387,19 @@ int main(void) {
         uint32_t slr_at_start = bench_mem_slow_read;
         uint32_t slw_at_start = bench_mem_slow_write;
         uint32_t cm_at_start  = bench_chunk_miss;
+#endif
 
         run_frame();
 
-        // Per-frame elapsed in µs.
+#if GBA_BENCH
+        // Per-frame elapsed in us.
         uint32_t frame_us = bench_freq_hz
             ? (uint32_t)((uint64_t)bench_elapsed(frame_t0) * 1000000ULL / bench_freq_hz)
             : 0;
         // Publish for the on-screen heartbeat overlay (lets the user
         // visually compare what bench thinks vs. what they perceive).
         bench_last_frame_us = frame_us;
+#endif
 
         clearevents();
 
@@ -394,6 +408,7 @@ int main(void) {
             continue;
         }
 
+#if GBA_DIAG_LOG
         // F3 = manual bench snapshot. Edge-detect so a held key only
         // captures once. Use this to grab a log mid-gameplay where the
         // scheduled snapshots can't reach (e.g., past frame 3600, or in
@@ -403,6 +418,7 @@ int main(void) {
             capture_now_pending = true;
         }
         f3_was_down = f3_now;
+#endif
 
         uint16_t pressed = 0;
         if (keydown(KEY_UP))    pressed |= BTN_U;
@@ -418,6 +434,7 @@ int main(void) {
 
         key_input.w = 0x3ff & ~pressed;
 
+#if GBA_DIAG_LOG
         // Capture diagnostic snapshots into a single in-memory buffer first,
         // then dump in one fwrite. fprintf-by-piece in gint world has been
         // crashing the calculator. Snapshots fire on a fixed schedule so we
@@ -651,6 +668,7 @@ int main(void) {
                 if (is_manual) manual_dumps++;
             }
         }
+#endif // GBA_DIAG_LOG
     }
 
     // Clean up ROM buffer resources

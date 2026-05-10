@@ -6,6 +6,7 @@
 #include "arm.h"
 #include "arm_mem.h"
 #include "arm_shared.h"
+#include "build_flags.h"
 
 #include "io.h"
 #include "timer.h"
@@ -433,11 +434,13 @@ static uint32_t arm_fetch_s() {
     return op;
 }
 
+#ifdef ARM_TRACE_ENABLE
 extern volatile uint32_t arm_first_low_pc;
 extern volatile uint32_t arm_first_low_lr;
 extern volatile uint32_t arm_first_low_op;
 extern volatile uint8_t  arm_first_low_was_thumb;
 extern volatile uint8_t  arm_first_low_set;
+#endif
 
 // Sentinel address used to mark a return-from-HLE'd-IRQ. The user IRQ
 // handler is invoked with LR = HLE_IRQ_RETURN_PC; when it does BX LR
@@ -2964,8 +2967,10 @@ static void t16_sub_sp7() {
 // this build doesn't implement these correctly (the function-pointer table
 // at 0x1F4 onwards has bogus data, sending control to low BIOS addresses),
 // so we intercept the SWI before it reaches the BIOS dispatcher.
+#ifdef ARM_TRACE_ENABLE
 extern volatile uint32_t arm_swi_count[256];
 extern volatile uint8_t  arm_swi_last;
+#endif
 
 static void hle_cpu_set(void) {
     uint32_t src     = arm_r.r[0];
@@ -3221,7 +3226,9 @@ static void hle_intr_wait(void) {
 // arm_int(VEC_IRQ, IRQ) path so the BIOS still runs in that case
 // (and lets early-boot code that depends on the BIOS's null-check
 // behavior work).
+#ifdef ARM_TRACE_ENABLE
 volatile uint32_t arm_hle_irq_count;
+#endif
 
 static void hle_irq_enter(uint32_t handler_addr) {
     // Mirror arm_int(VEC_IRQ, IRQ) for the state-save half: pack flags,
@@ -3262,7 +3269,9 @@ static void hle_irq_enter(uint32_t handler_addr) {
     arm_flag_set(ARM_I, true);
 
     arm_r.r[15] = handler_addr;
+#ifdef ARM_TRACE_ENABLE
     arm_hle_irq_count++;
+#endif
     arm_load_pipe();
 }
 
@@ -3290,8 +3299,10 @@ static void hle_irq_return(void) {
 }
 
 static bool hle_swi(uint8_t swi_num) {
+#ifdef ARM_TRACE_ENABLE
     arm_swi_last = swi_num;
     arm_swi_count[swi_num]++;
+#endif
     switch (swi_num) {
         case 0x01: hle_register_ram_reset(); return true;
         case 0x02: hle_halt();               return true;
@@ -3385,15 +3396,19 @@ static void arm_umull() {
 }
 
 //Undefined
+#ifdef ARM_TRACE_ENABLE
 extern volatile uint32_t arm_undef_count;
 extern volatile uint32_t arm_undef_first_pc;
 extern volatile uint32_t arm_undef_first_op;
+#endif
 static void arm_und() {
+#ifdef ARM_TRACE_ENABLE
     if (arm_undef_count == 0) {
         arm_undef_first_pc = arm_r.r[15];
         arm_undef_first_op = arm_op;
     }
     arm_undef_count++;
+#endif
     arm_int(ARM_VEC_UND, ARM_UND);
 }
 
@@ -3818,6 +3833,7 @@ static inline void arm_step() {
     arm_inc_r15();
 }
 
+#ifdef ARM_TRACE_ENABLE
 // Sparse PC trace, sampled every Nth instruction. Lets the diagnostic dump
 // show where execution is actually spending its time within one frame.
 #define ARM_PC_TRACE_LEN 16
@@ -3834,6 +3850,7 @@ volatile uint8_t  arm_first_low_was_thumb;
 volatile uint8_t  arm_first_low_set;
 volatile uint32_t arm_swi_count[256];
 volatile uint8_t  arm_swi_last;
+#endif
 
 // Place the inner dispatch loop into ILRAM (4 KB on-chip code RAM, 0-wait,
 // never evicted from I-cache). t16_step and arm_step are static inline and
@@ -3867,28 +3884,61 @@ void arm_exec(uint32_t target_cycles) {
     // games tolerate this since they only check timers at VBlank anyway.
     uint32_t start_cycles = arm_cycles;
 
+    // Split inner dispatch loops: each spins on one mode (Thumb or ARM)
+    // and only exits back to the outer loop when the mode actually flips
+    // (BX/BLX/SWI/IRQ entry/exit, etc.). This eliminates the per-
+    // instruction `arm_in_thumb()` check from the steady-state path and
+    // lets the compiler specialise the loop body for each mode -- the
+    // inlined Thumb dispatch (a 13-case switch + opcode handlers) is a
+    // very different shape from the ARM dispatch (compressed proc-handler
+    // table indirect through arm_proc_idx_*).
+    //
+    // The outer while keeps re-entering the right inner loop each time
+    // the mode flips, so total per-instruction work is unchanged for
+    // mode-flipping code (rare) but cheaper for mode-stable runs (the
+    // overwhelming common case in any game's hot loop).
     while (arm_cycles < target_cycles) {
-        arm_op      = arm_pipe[0];
-        arm_pipe[0] = arm_pipe[1];
+        if (arm_in_thumb()) {
+            do {
+                arm_op      = arm_pipe[0];
+                arm_pipe[0] = arm_pipe[1];
 
 #ifdef ARM_TRACE_ENABLE
-        // Per-instruction PC trace, sampled every 4096 instructions. Useful
-        // for diagnosing where execution is spending its time, but the
-        // increment + AND check costs a few SH4 cycles per emulated ARM
-        // instruction. Compile with -DARM_TRACE_ENABLE to opt back in.
-        if ((arm_pc_trace_skip++ & 0xfff) == 0) {
-            arm_pc_trace[arm_pc_trace_pos & (ARM_PC_TRACE_LEN - 1)] = arm_r.r[15];
-            arm_pc_trace_pos++;
-        }
+                if ((arm_pc_trace_skip++ & 0xfff) == 0) {
+                    arm_pc_trace[arm_pc_trace_pos & (ARM_PC_TRACE_LEN - 1)] = arm_r.r[15];
+                    arm_pc_trace_pos++;
+                }
 #endif
 
-        if (arm_in_thumb())
-            t16_step();
-        else
-            arm_step();
+                t16_step();
 
-        if (int_halt) arm_cycles = target_cycles;
+                if (int_halt) {
+                    arm_cycles = target_cycles;
+                    goto done;
+                }
+            } while (arm_cycles < target_cycles && arm_in_thumb());
+        } else {
+            do {
+                arm_op      = arm_pipe[0];
+                arm_pipe[0] = arm_pipe[1];
+
+#ifdef ARM_TRACE_ENABLE
+                if ((arm_pc_trace_skip++ & 0xfff) == 0) {
+                    arm_pc_trace[arm_pc_trace_pos & (ARM_PC_TRACE_LEN - 1)] = arm_r.r[15];
+                    arm_pc_trace_pos++;
+                }
+#endif
+
+                arm_step();
+
+                if (int_halt) {
+                    arm_cycles = target_cycles;
+                    goto done;
+                }
+            } while (arm_cycles < target_cycles && !arm_in_thumb());
+        }
     }
+done:
 
     if (tmr_enb) timers_clock(arm_cycles - start_cycles);
     arm_cycles -= target_cycles;

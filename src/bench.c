@@ -1,5 +1,7 @@
 #include "bench.h"
 
+#if GBA_BENCH
+
 #include <gint/timer.h>
 #include <gint/mpu/tmu.h>
 #include <gint/clock.h>
@@ -93,3 +95,5 @@ uint32_t bench_elapsed(uint32_t start) {
     }
     return start + (bench_tcor - now);
 }
+
+#endif // GBA_BENCH

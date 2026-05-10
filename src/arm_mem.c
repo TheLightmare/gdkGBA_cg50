@@ -4,6 +4,7 @@
 #include "arm.h"
 #include "arm_mem.h"
 #include "bench.h"
+#include "build_flags.h"
 #include "io.h"
 #include "rom_buffer.h"
 #include "extram.h"
@@ -313,7 +314,7 @@ static uint8_t arm_read_(uint32_t address, uint8_t offset) {
 // the page-table fast path can't serve the read (BIOS/IO/VRAM/ROM/Flash/
 // EEPROM, plus any unmapped region where open-bus behavior matters).
 uint8_t arm_readb_slow(uint32_t address) {
-    bench_mem_slow_read++;
+    BENCH_INC(bench_mem_slow_read);
     uint8_t value = arm_read_(address, 0);
 
     if (!(address & 0x08000000)) {
@@ -327,7 +328,7 @@ uint8_t arm_readb_slow(uint32_t address) {
 }
 
 uint32_t arm_readh_slow(uint32_t address) {
-    bench_mem_slow_read++;
+    BENCH_INC(bench_mem_slow_read);
     uint32_t a = address & ~1;
     uint8_t  s = address &  1;
     uint32_t value;
@@ -356,7 +357,7 @@ uint32_t arm_readh_slow(uint32_t address) {
 }
 
 uint32_t arm_read_slow(uint32_t address) {
-    bench_mem_slow_read++;
+    BENCH_INC(bench_mem_slow_read);
     uint32_t a = address & ~3;
     uint8_t  s = address &  3;
     uint32_t value;
@@ -644,7 +645,7 @@ static void flash_write(uint32_t address, uint8_t value) {
 }
 
 static void arm_write_(uint32_t address, uint8_t offset, uint8_t value) {
-    bench_mem_slow_write++;
+    BENCH_INC(bench_mem_slow_write);
     switch (address >> 24) {
         case 0x2: wram_write(address, value); break;
         case 0x3: iwram_write(address, value); break;

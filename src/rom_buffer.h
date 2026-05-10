@@ -35,6 +35,32 @@
 #define ROM_CHUNK_SIZE     (32 * 1024)
 #define ROM_BUFFER_CHUNKS  88
 
+// Direct-mapped hash table from chunk address to chunk index. Lookup is
+// O(1) when the entry is fresh; on collision we fall back to a linear
+// scan of chunk_addresses[] (also handles a stale entry whose owning
+// chunk got displaced from this slot by another chunk with the same
+// hash). Sized to 256 -- with 88 active chunks the average occupancy is
+// well under 0.5 and the fallback scan is rare in practice.
+//
+// Each entry is 8 bytes (4 + 2 + 2 padding), total table = 2 KB. Lives
+// alongside RomBuffer in XYRAM so lookups don't pay external bus latency.
+#define ROM_LOOKUP_SIZE  256
+#define ROM_LOOKUP_MASK  (ROM_LOOKUP_SIZE - 1)
+
+typedef struct {
+    uint32_t chunk_addr;   // sentinel: 0xFFFFFFFF means "empty"
+    int16_t  chunk_idx;    // sentinel: -1 means "empty"
+    uint16_t _pad;
+} RomLookupEntry;
+
+// Map a chunk-aligned address (32 KB granularity) to its lookup-table slot.
+// chunk_addr / ROM_CHUNK_SIZE folds to >> 15 since ROM_CHUNK_SIZE is a
+// power of two; using division keeps the formula maintainable if the
+// chunk size is ever retuned.
+static inline uint32_t rom_chunk_hash(uint32_t chunk_addr) {
+    return (chunk_addr / ROM_CHUNK_SIZE) & ROM_LOOKUP_MASK;
+}
+
 typedef struct {
     FILE* rom_file;           // File handle for the ROM
     uint32_t rom_size;        // Total size of the ROM
@@ -47,12 +73,25 @@ typedef struct {
     // Buffer data
     uint8_t* chunk_buffers[ROM_BUFFER_CHUNKS];
     uint32_t chunk_addresses[ROM_BUFFER_CHUNKS];  // Start address of each chunk
-    int8_t chunk_lru[ROM_BUFFER_CHUNKS];         // LRU counter for each chunk
+
+    // Monotonic-timestamp LRU. lru_clock increments on every chunk-find
+    // (after the last_chunk fast path), and chunk_lru_ts[i] records when
+    // chunk i was last touched. Eviction picks the chunk with the smallest
+    // timestamp. Replaces the prior O(N) "decrement every chunk's counter"
+    // scheme. uint32_t wraparound is theoretical at the rates we see
+    // (~1M increments/s tops, ~70 minutes to wrap) and at worst causes
+    // one suboptimal eviction, not a correctness bug.
+    uint32_t chunk_lru_ts[ROM_BUFFER_CHUNKS];
+    uint32_t lru_clock;
 
     // Hot-path cache: the last chunk address served, and its index. Lets the
-    // common "same chunk as last access" hit skip the LRU loop entirely.
+    // common "same chunk as last access" hit skip even the hash lookup.
     uint32_t last_chunk_address;
     int8_t   last_chunk_idx;
+
+    // Direct-mapped lookup table (indexed by rom_chunk_hash). See
+    // get_chunk_for_address in rom_buffer.c for the maintenance protocol.
+    RomLookupEntry chunk_lookup[ROM_LOOKUP_SIZE];
 } RomBuffer;
 
 // Failure reason returned by rom_buffer_init via the optional out-param.

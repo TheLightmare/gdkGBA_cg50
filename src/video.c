@@ -1,6 +1,7 @@
 #include "arm.h"
 #include "arm_mem.h"
 #include "bench.h"
+#include "build_flags.h"
 
 #include "dma.h"
 #include "io.h"
@@ -568,29 +569,19 @@ void run_frame() {
             dma_transfer_gba(VBLANK);
         }
 
-        {
-            uint32_t t0 = bench_now();
-            arm_exec(CYC_LINE_HBLK0);
-            bench_arm_exec_ticks += bench_elapsed(t0);
-        }
+        BENCH_TIME_BLOCK(bench_arm_exec_ticks, arm_exec(CYC_LINE_HBLK0));
 
         //H-Blank start
         if (v_count.w < LINES_VISIBLE) {
             if (render_this_frame) {
-                uint32_t t0 = bench_now();
-                render_line();
-                bench_render_ticks += bench_elapsed(t0);
+                BENCH_TIME_BLOCK(bench_render_ticks, render_line());
             }
             dma_transfer_gba(HBLANK);
         }
 
         hblank_start();
 
-        {
-            uint32_t t0 = bench_now();
-            arm_exec(CYC_LINE_HBLK1);
-            bench_arm_exec_ticks += bench_elapsed(t0);
-        }
+        BENCH_TIME_BLOCK(bench_arm_exec_ticks, arm_exec(CYC_LINE_HBLK1));
 
         // Sound is not piped to any output yet, and sound_clock() does
         // double-precision FP math per scanline that is very slow on the
@@ -603,12 +594,12 @@ void run_frame() {
     // the dupdate that we're trying to avoid.
     if (!render_this_frame) return;
 
+#if GBA_DEBUG_OVERLAY
     // Frame heartbeat + diagnostic overlay. Lives in the white margin below
     // the centered GBA viewport so it never collides with the emulated frame.
     {
-        extern arm_regs_t arm_r;
-        extern bool int_halt;
         extern io_reg int_enb, int_ack, int_enb_m;
+        (void)int_enb_m;
 
         static uint32_t frame_count = 0;
         static const uint16_t hb_colors[4] = { 0xf800, 0x07e0, 0x001f, 0xffff };
@@ -644,9 +635,9 @@ void run_frame() {
         // visually verify whether bench numbers match perceived speed.
         // last_frame_us is the previous frame's wall-clock measurement
         // (this frame's overlay is rendered before its own frame_us is
-        // computed, so we always lag by 1 frame — fine for diagnostics).
+        // computed, so we always lag by 1 frame -- fine for diagnostics).
         uint32_t flu = bench_last_frame_us;
-        uint32_t fps10 = (flu > 0) ? (10000000u / flu) : 0;  // fps × 10
+        uint32_t fps10 = (flu > 0) ? (10000000u / flu) : 0;  // fps x 10
         dprint(2, 210, C_BLACK,
                "%lu us/f  %lu.%lu fps  halt:%d IE:%04X IF:%04X",
                (unsigned long)flu,
@@ -658,13 +649,10 @@ void run_frame() {
 
         frame_count++;
     }
+#endif // GBA_DEBUG_OVERLAY
 
     // gint_vram is the active framebuffer; just push it to the display.
-    {
-        uint32_t t0 = bench_now();
-        dupdate();
-        bench_dupdate_ticks += bench_elapsed(t0);
-    }
+    BENCH_TIME_BLOCK(bench_dupdate_ticks, dupdate());
 
     // sound_buffer_wrap();   // see note above on sound_clock()
 }

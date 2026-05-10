@@ -2,18 +2,24 @@
 #define BENCH_H
 
 #include <stdint.h>
+#include "build_flags.h"
 
 // Lightweight wall-clock benchmarking using a free-running TMU.
 //
-// One TMU is reserved at boot at Pphi/4 (~4 MHz, ~250 ns per tick on stock
-// CG-50). bench_now() reads the current TCNT value, which counts down from
-// TCOR to 0 then reloads. bench_elapsed(start) returns ticks since `start`,
-// handling at most one wrap (so single-call duration must be < TCOR period,
-// which is set to 1 second — far longer than any single frame phase).
+// One TMU is reserved at boot (Pphi/16 on stock CG-50). bench_now() reads
+// the current TCNT value, which counts down from TCOR to 0 then reloads.
+// bench_elapsed(start) returns ticks since `start`, handling at most one
+// wrap (so single-call duration must be < TCOR period, set to 60 s).
 //
 // Phase accumulators (ticks): summed across all calls within a frame. They
-// are reset each time a diagnostic snapshot reads them, so each snapshot
-// reports the per-frame totals for the most recent frame.
+// are reset by the diagnostic snapshot reader, so each snapshot reports
+// the per-frame totals for the most recent frame.
+//
+// Hot-path code should use BENCH_TIME_BLOCK / BENCH_INC from build_flags.h
+// rather than calling bench_now/bench_elapsed directly -- those macros
+// vanish entirely in release builds.
+
+#if GBA_BENCH
 
 void bench_init(void);
 
@@ -30,7 +36,7 @@ extern uint64_t bench_dupdate_ticks;
 // fps is" alongside the user's visual perception.
 extern uint32_t bench_last_frame_us;
 
-// Frequency of the bench timer in Hz (so callers can convert to µs).
+// Frequency of the bench timer in Hz (so callers can convert to us).
 // 0 if no TMU could be reserved.
 extern uint32_t bench_freq_hz;
 
@@ -39,5 +45,15 @@ extern uint32_t bench_freq_hz;
 extern uint32_t bench_mem_slow_read;
 extern uint32_t bench_mem_slow_write;
 extern uint32_t bench_chunk_miss;
+
+#else  // !GBA_BENCH
+
+// Release builds: bench is fully compiled out. Provide an inline no-op
+// bench_init() so the call in main() doesn't need to be #if'd. The other
+// symbols are not declared on purpose -- any code that still references
+// them in release would be a bug, and the link error is the right signal.
+static inline void bench_init(void) {}
+
+#endif
 
 #endif

@@ -5,6 +5,7 @@
 #include <gint/kmalloc.h>
 
 #include "bench.h"
+#include "build_flags.h"
 #include "extram.h"
 
 // Allocate a chunk buffer. Prefers the optional "extram" arena (3 MB on
@@ -107,57 +108,101 @@ static bool load_chunk(RomBuffer* buffer, int chunk_idx, uint32_t chunk_address)
     return true;
 }
 
-// Find the chunk containing the specified address, load it if necessary
+// Find the chunk containing the specified address, load it if necessary.
+//
+// Lookup order:
+//   1. last_chunk fast path (handles >99% of accesses in the hot loop).
+//   2. Direct hash table (O(1), maintained alongside chunk loads/evictions).
+//   3. Linear scan of active chunks (handles hash collisions and any case
+//      where a chunk is in the cache but its table slot got displaced).
+//      Also tracks the LRU candidate so a true miss doesn't pay a second
+//      pass.
+//   4. On a true miss: evict the LRU chunk, fread the new one, refresh
+//      both the table and last_chunk pointers.
 static int get_chunk_for_address(RomBuffer* buffer, uint32_t address) {
     uint32_t chunk_address = address & ~(ROM_CHUNK_SIZE - 1);
 
-    // Hot path: same chunk as the previous access. No LRU bookkeeping.
+    // 1. Hot path: same chunk as the previous access. No bookkeeping.
     if (chunk_address == buffer->last_chunk_address && buffer->last_chunk_idx >= 0)
         return buffer->last_chunk_idx;
 
-    int active = buffer->active_chunks;
-    int lru_chunk = 0;
-    int lru_value = buffer->chunk_lru[0];
-
-    // First, check if the chunk is already loaded
-    for (int i = 0; i < active; i++) {
+    // 2. Direct hash lookup. Fresh entries are authoritative; stale entries
+    //    fall through to the linear scan, which refreshes the table.
+    uint32_t h = rom_chunk_hash(chunk_address);
+    RomLookupEntry *e = &buffer->chunk_lookup[h];
+    if (e->chunk_addr == chunk_address && e->chunk_idx >= 0) {
+        int i = e->chunk_idx;
         if (buffer->chunk_addresses[i] == chunk_address) {
-            // Found it! Update LRU counters
-            buffer->chunk_lru[i] = active;
-            for (int j = 0; j < active; j++) {
-                if (j != i && buffer->chunk_lru[j] > 0) {
-                    buffer->chunk_lru[j]--;
-                }
-            }
+            buffer->chunk_lru_ts[i] = ++buffer->lru_clock;
             buffer->last_chunk_address = chunk_address;
             buffer->last_chunk_idx = i;
             return i;
         }
+        // Stale: chunk_addresses[i] no longer holds chunk_address. Fall
+        // through; the linear scan will either find it elsewhere or
+        // declare a true miss.
+    }
 
-        // Track the least recently used chunk
-        if (buffer->chunk_lru[i] < lru_value) {
-            lru_value = buffer->chunk_lru[i];
-            lru_chunk = i;
+    // 3. Linear-scan fallback. Single pass: locate the chunk OR the LRU
+    //    eviction target. Empty slots (chunk_addresses[i] == 0xFFFFFFFF)
+    //    are picked up as natural eviction targets via their initial LRU
+    //    timestamp of 0.
+    int active = buffer->active_chunks;
+    int lru_idx = 0;
+    uint32_t lru_ts = buffer->chunk_lru_ts[0];
+
+    for (int i = 0; i < active; i++) {
+        uint32_t addr_i = buffer->chunk_addresses[i];
+        if (addr_i == chunk_address) {
+            buffer->chunk_lru_ts[i] = ++buffer->lru_clock;
+            buffer->last_chunk_address = chunk_address;
+            buffer->last_chunk_idx = i;
+            // Refresh the table -- might have been displaced by a hash
+            // collision, or this chunk was loaded before its slot was
+            // owned by it.
+            e->chunk_addr = chunk_address;
+            e->chunk_idx = (int16_t)i;
+            return i;
+        }
+        uint32_t ts_i = buffer->chunk_lru_ts[i];
+        if (ts_i < lru_ts) {
+            lru_ts = ts_i;
+            lru_idx = i;
         }
     }
 
-    // Chunk not found, replace the least recently used one
-    bench_chunk_miss++;
-    if (!load_chunk(buffer, lru_chunk, chunk_address)) {
+    // 4. True miss. Evict the LRU chunk and load the new one.
+    BENCH_INC(bench_chunk_miss);
+
+    // Invalidate the table entry that pointed at the chunk we're about to
+    // overwrite, but only if it still owns this slot (a later access to a
+    // colliding chunk may already have stolen it -- in which case there's
+    // nothing for us to clean up).
+    uint32_t evicting_addr = buffer->chunk_addresses[lru_idx];
+    if (evicting_addr != 0xFFFFFFFFu) {
+        uint32_t old_h = rom_chunk_hash(evicting_addr);
+        RomLookupEntry *old_e = &buffer->chunk_lookup[old_h];
+        if (old_e->chunk_idx == lru_idx && old_e->chunk_addr == evicting_addr) {
+            old_e->chunk_addr = 0xFFFFFFFFu;
+            old_e->chunk_idx = -1;
+        }
+    }
+
+    if (!load_chunk(buffer, lru_idx, chunk_address)) {
         return -1;  // Failed to load chunk
     }
 
-    // Update LRU counters
-    buffer->chunk_lru[lru_chunk] = active;
-    for (int j = 0; j < active; j++) {
-        if (j != lru_chunk && buffer->chunk_lru[j] > 0) {
-            buffer->chunk_lru[j]--;
-        }
-    }
-
+    buffer->chunk_lru_ts[lru_idx] = ++buffer->lru_clock;
     buffer->last_chunk_address = chunk_address;
-    buffer->last_chunk_idx = lru_chunk;
-    return lru_chunk;
+    buffer->last_chunk_idx = lru_idx;
+
+    // Install in the table. May overwrite an entry for a different chunk
+    // that hashes here; that older chunk stays reachable via linear scan
+    // and will refresh its own entry on next access.
+    e->chunk_addr = chunk_address;
+    e->chunk_idx = (int16_t)lru_idx;
+
+    return lru_idx;
 }
 
 bool rom_buffer_init(RomBuffer* buffer, const char* filename, uint32_t rom_mask,
@@ -178,6 +223,14 @@ bool rom_buffer_init(RomBuffer* buffer, const char* filename, uint32_t rom_mask,
     buffer->last_chunk_address = 0xFFFFFFFF;
     buffer->last_chunk_idx = -1;
     buffer->active_chunks = 0;
+    buffer->lru_clock = 0;
+
+    // Empty out the direct-lookup table.
+    for (int i = 0; i < ROM_LOOKUP_SIZE; i++) {
+        buffer->chunk_lookup[i].chunk_addr = 0xFFFFFFFFu;
+        buffer->chunk_lookup[i].chunk_idx  = -1;
+        buffer->chunk_lookup[i]._pad       = 0;
+    }
 
     // Allocate chunks. Each one prefers extram, falls back to default heap.
     // If we can't get the full ROM_BUFFER_CHUNKS, accept any count >= 2 --
@@ -200,7 +253,9 @@ bool rom_buffer_init(RomBuffer* buffer, const char* filename, uint32_t rom_mask,
         }
 
         buffer->chunk_addresses[i] = 0xFFFFFFFF;
-        buffer->chunk_lru[i] = i;
+        // Initial timestamp 0 -- empty slots are picked up first as
+        // eviction targets without needing any special-case code.
+        buffer->chunk_lru_ts[i] = 0;
         buffer->active_chunks = i + 1;
     }
 

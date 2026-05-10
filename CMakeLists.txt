@@ -46,6 +46,43 @@ add_executable(myaddin ${SOURCES} ${ASSETS} ${ASSETS_${FXSDK_PLATFORM}})
 target_compile_options(myaddin PRIVATE -Wall -Wextra -Os)
 target_link_libraries(myaddin Gint::Gint)
 
+# Build flavor: release | bench | trace
+#
+# release (default): no diagnostics. The interpreter, memory dispatch and
+#                    renderer run without any bench timer wraps, slow-path
+#                    counters, on-screen overlay, fxgba_log.txt snapshots,
+#                    or arm trace bookkeeping. Use for performance numbers.
+# bench:             enables phase timers (bench_arm_exec_ticks etc.) and
+#                    slow-path counters (bench_mem_slow_*, bench_chunk_miss).
+#                    No overlay, no log file. Adds bench_now()/bench_elapsed
+#                    overhead around arm_exec / render_line / dupdate.
+# trace:             everything bench has, plus the on-screen heartbeat,
+#                    boot dump + per-frame snapshot machinery to
+#                    fxgba_log.txt, PC trace, undef/SWI counts. Behaves
+#                    like the legacy build.
+#
+# Power users can also set GBA_BENCH / GBA_DEBUG_OVERLAY / GBA_DIAG_LOG /
+# GBA_TRACE individually -- GBA_BUILD just expands to a sensible default
+# combination. See src/build_flags.h.
+set(GBA_BUILD "release" CACHE STRING "Build flavor: release | bench | trace")
+set_property(CACHE GBA_BUILD PROPERTY STRINGS release bench trace)
+
+if(GBA_BUILD STREQUAL "trace")
+    target_compile_definitions(myaddin PRIVATE
+        GBA_BENCH=1
+        GBA_DEBUG_OVERLAY=1
+        GBA_DIAG_LOG=1
+        GBA_TRACE=1)
+elseif(GBA_BUILD STREQUAL "bench")
+    target_compile_definitions(myaddin PRIVATE GBA_BENCH=1)
+elseif(GBA_BUILD STREQUAL "release")
+    # No diagnostic flags. The hot path stays clean.
+else()
+    message(FATAL_ERROR
+        "GBA_BUILD must be one of: release | bench | trace (got '${GBA_BUILD}')")
+endif()
+message(STATUS "GBA_BUILD = ${GBA_BUILD}")
+
 # Link-time optimization: lets the linker inline across translation
 # units. Critical here because arm_read() in arm_mem.c calls
 # rom_buffer_read_32() in rom_buffer.c -- without -flto the call goes
