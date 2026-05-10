@@ -31,29 +31,32 @@ void *screen;
 static const uint8_t x_tiles_lut[16] = { 1, 2, 4, 8, 2, 4, 4, 8, 1, 1, 2, 4, 0, 0, 0, 0 };
 static const uint8_t y_tiles_lut[16] = { 1, 2, 4, 8, 1, 1, 2, 4, 2, 4, 4, 8, 0, 0, 0, 0 };
 
-// Per-pixel BG/OBJ enable mask for the current scanline.
+// Per-pixel BG/OBJ enable mask for the current scanline. Only populated
+// when at least one window is enabled. The render fast path skips the
+// per-pixel mask check entirely when windows_active is false, avoiding
+// layer_mask memory traffic on the (very common) games-without-windows
+// path.
 //   bit 0 = BG0 visible
 //   bit 1 = BG1 visible
 //   bit 2 = BG2 visible
 //   bit 3 = BG3 visible
 //   bit 4 = OBJ visible
-// When no windows are enabled, every pixel gets 0x1f (everything DISPCNT
-// permits is visible). With WIN0/WIN1 active, we filter per-pixel using
-// WININ inside the window region and WINOUT elsewhere.
 //
 // The OBJ window (DISPCNT bit 15) is not yet implemented — it would need
 // a pre-render pass to mark sprite-touching pixels — so games using only
 // it will still render their OBJs everywhere.
 static uint8_t layer_mask[240];
+static bool    windows_active;
 
 static void compute_layer_mask(void) {
-    bool win0_on    = (disp_cnt.w >> 13) & 1;
-    bool win1_on    = (disp_cnt.w >> 14) & 1;
-    bool objwin_on  = (disp_cnt.w >> 15) & 1;
+    bool win0_on   = (disp_cnt.w >> 13) & 1;
+    bool win1_on   = (disp_cnt.w >> 14) & 1;
+    bool objwin_on = (disp_cnt.w >> 15) & 1;
 
-    if (!win0_on && !win1_on && !objwin_on) {
-        // Fast path: no windows. Everything DISPCNT enables is visible.
-        for (int x = 0; x < 240; x++) layer_mask[x] = 0x1f;
+    windows_active = win0_on || win1_on || objwin_on;
+    if (!windows_active) {
+        // Fast path: no windows are active for this scanline. Skip the
+        // memset; render code will short-circuit the mask check.
         return;
     }
 
@@ -219,7 +222,8 @@ static void render_obj(uint8_t prio) {
                             ? src[cx]
                             : ((src[cx >> 1] >> ((cx & 1) * 4)) & 0xf);
 
-                        if (pal_idx && (layer_mask[sx] & 0x10)) {
+                        if (pal_idx
+                            && (!windows_active || (layer_mask[sx] & 0x10))) {
                             uint32_t pal_addr = 0x100 | pal_idx | pal_base;
                             *(uint16_t *)((uint8_t *)screen + address + i * 2)
                                 = palette[pal_addr];
@@ -269,7 +273,8 @@ static void render_obj(uint8_t prio) {
 
                     uint32_t pal_addr = 0x100 | pal_idx | (!is_256 ? chr_pal * 16 : 0);
 
-                    if (pal_idx && (layer_mask[obj_x + x] & 0x10))
+                    if (pal_idx
+                        && (!windows_active || (layer_mask[obj_x + x] & 0x10)))
                         *(uint16_t *)((uint8_t *)screen + address) = palette[pal_addr];
                 }
             }
@@ -349,7 +354,9 @@ static void render_bg() {
 
                             uint16_t pal_idx = vram[vram_addr];
 
-                            if (pal_idx && (layer_mask[x] & (1 << bg_idx)))
+                            if (pal_idx
+                                && (!windows_active
+                                    || (layer_mask[x] & (1 << bg_idx))))
                                 *(uint16_t *)((uint8_t *)screen + address) = palette[pal_idx];
                         }
                     } else {
@@ -418,7 +425,8 @@ static void render_bg() {
                                 }
 
                                 if (pal_idx
-                                    && (layer_mask[x + i] & bg_bit)) {
+                                    && (!windows_active
+                                        || (layer_mask[x + i] & bg_bit))) {
                                     *(uint16_t *)((uint8_t *)screen + address)
                                         = palette[pal_idx | pal_base];
                                 }
@@ -522,13 +530,17 @@ static void vcount_match() {
 // cart's main loop is unaffected -- arm_exec, IRQs, DMAs, and v_count all
 // advance at full rate -- so game logic keeps real-time. We just elide the
 // per-pixel render_line() work and the ~11 ms dupdate() flush on skipped
-// frames. Display ends up showing every (FRAMESKIP+1)-th frame, which the
-// human eye accepts much more readily than emulator slowdown.
-//   FRAMESKIP=0: render every frame  (no skipping)
-//   FRAMESKIP=1: render every other  (recommended)
-//   FRAMESKIP=2: render 1 in 3       (very fast, choppier)
+// frames.
+//
+// As of Pass 9.12, FRAMESKIP=0 (render every frame) gave no measurable
+// slowdown vs. FRAMESKIP=1 in Minish Cap gameplay -- arm_exec is the
+// bottleneck, render+dupdate fits comfortably in the per-frame budget.
+// Kept as a build switch in case a render-heavier game emerges.
+//   FRAMESKIP=0: render every frame   (current default)
+//   FRAMESKIP=1: render every other
+//   FRAMESKIP=2: render 1 in 3
 #ifndef FRAMESKIP
-#define FRAMESKIP 1
+#define FRAMESKIP 0
 #endif
 
 void run_frame() {
@@ -628,11 +640,19 @@ void run_frame() {
                (unsigned)disp_cnt.w,
                (unsigned)palette[0]);
 
+        // Show the bench's measured frame time + derived fps, so we can
+        // visually verify whether bench numbers match perceived speed.
+        // last_frame_us is the previous frame's wall-clock measurement
+        // (this frame's overlay is rendered before its own frame_us is
+        // computed, so we always lag by 1 frame — fine for diagnostics).
+        uint32_t flu = bench_last_frame_us;
+        uint32_t fps10 = (flu > 0) ? (10000000u / flu) : 0;  // fps × 10
         dprint(2, 210, C_BLACK,
-               "CPSR:%08lX halt:%d IME:%X IE:%04X IF:%04X",
-               (unsigned long)arm_r.cpsr,
+               "%lu us/f  %lu.%lu fps  halt:%d IE:%04X IF:%04X",
+               (unsigned long)flu,
+               (unsigned long)(fps10 / 10),
+               (unsigned long)(fps10 % 10),
                (int)int_halt,
-               (unsigned)(int_enb_m.w & 1),
                (unsigned)int_enb.w,
                (unsigned)int_ack.w);
 

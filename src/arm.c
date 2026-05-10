@@ -439,7 +439,40 @@ extern volatile uint32_t arm_first_low_op;
 extern volatile uint8_t  arm_first_low_was_thumb;
 extern volatile uint8_t  arm_first_low_set;
 
+// Sentinel address used to mark a return-from-HLE'd-IRQ. The user IRQ
+// handler is invoked with LR = HLE_IRQ_RETURN_PC; when it does BX LR
+// (or any other return form), PC becomes the sentinel and arm_load_pipe()
+// runs the BIOS post-handler equivalent in place of fetching at the
+// sentinel address. Chosen at 0xFFFF0000: region 0xFF is unmapped on
+// the GBA, so no real cart code or data can ever legitimately land here.
+#define HLE_IRQ_RETURN_PC  0xFFFF0000u
+
+// Forward declaration; definition is colocated with the rest of the IRQ
+// HLE near hle_swi() further down.
+static void hle_irq_return(void);
+
+// SH4A prefetch hint: non-blocking line fill into the operand cache.
+// `pref @Rn` triggers an async fetch and returns immediately; if the line
+// is already cached or the address is unmapped, it's a no-op. We use it
+// to warm the cache line just past the basic block we're about to step
+// through, hiding extram-chunk-buffer load latency behind the dispatch
+// itself.
+static inline void sh4_pref(const void *p) {
+    __asm__ volatile ("pref @%0" : : "r" (p));
+}
+
 static void arm_load_pipe() {
+    // Detect return from an HLE'd IRQ before attempting any fetch. The
+    // sentinel address is unmapped; calling arm_fetch_n at sentinel would
+    // hit the slow path and return garbage. hle_irq_return restores the
+    // saved registers + CPSR and overwrites arm_r.r[15] with the real
+    // return address, then we fall through to the normal fetch logic.
+    if (arm_r.r[15] == HLE_IRQ_RETURN_PC) {
+        hle_irq_return();
+        // hle_irq_return updates arm_r.r[15] (and ARM_T flag) to the
+        // real return address. Fall through to fetch from there.
+    }
+
 #ifdef ARM_TRACE_ENABLE
     // Tripwire: first time PC drops below 0x4000 from any branch. Used in
     // the past to find spurious entries into BIOS region. Costs a compare
@@ -456,6 +489,24 @@ static void arm_load_pipe() {
 
     arm_pipe[0] = arm_fetch_n();
     arm_pipe[1] = arm_fetch_s();
+
+    // Prefetch the next 32-byte line of cart ROM. Per-branch overhead is
+    // negligible; the line will be hot when t16_step / arm_step starts
+    // walking the basic block. Only fire when the target is in the cart
+    // ROM regions (where chunk-buffer reads pay extram bus latency)
+    // AND the line stays inside the currently-pinned chunk — straddling
+    // would prefetch the wrong physical address (the chunk_buffer of the
+    // *current* chunk, not the one that holds the straddled bytes).
+    {
+        uint32_t pc8 = arm_r.r[15] >> 24;
+        if (pc8 >= 0x8 && pc8 <= 0xd && rom_buffer.last_chunk_idx >= 0) {
+            uint32_t off = arm_r.r[15] & (ROM_CHUNK_SIZE - 1);
+            if (off < ROM_CHUNK_SIZE - 64) {
+                sh4_pref(rom_buffer.chunk_buffers[rom_buffer.last_chunk_idx]
+                         + ((off + 32) & ~31u));
+            }
+        }
+    }
 
     pipe_reload = true;
 }
@@ -633,7 +684,7 @@ static void arm_logic(arm_data_t op, arm_logic_e inst) {
     arm_logic_set(op, res);
 }
 
-static void arm_asr(arm_data_t op) {
+static inline void arm_asr(arm_data_t op) {
     int64_t val = (int32_t)op.lhs;
     uint8_t sh = op.rhs;
 
@@ -647,7 +698,7 @@ static void arm_asr(arm_data_t op) {
     arm_logic_set(op, op.rhs);
 }
 
-static void arm_lsl(arm_data_t op) {
+static inline void arm_lsl(arm_data_t op) {
     uint64_t val = op.lhs;
     uint8_t sh = op.rhs;
 
@@ -669,7 +720,7 @@ static void arm_lsl(arm_data_t op) {
     arm_logic_set(op, op.rhs);
 }
 
-static void arm_lsr(arm_data_t op) {
+static inline void arm_lsr(arm_data_t op) {
     uint64_t val = op.lhs;
     uint8_t sh = op.rhs;
 
@@ -1498,7 +1549,7 @@ static void arm_memio_stm_usr(arm_memio_t op) {
     arm_mode_set(mode);
 }
 
-static void arm_memio_ldr(arm_memio_t op) {
+static inline void arm_memio_ldr(arm_memio_t op) {
     arm_r.r[op.rt] = arm_read_n(op.addr);
 
     if (op.rt == 15) {
@@ -1511,7 +1562,7 @@ static void arm_memio_ldr(arm_memio_t op) {
     arm_cycles_s_to_n();
 }
 
-static void arm_memio_ldrb(arm_memio_t op) {
+static inline void arm_memio_ldrb(arm_memio_t op) {
     arm_r.r[op.rt] = arm_readb_n(op.addr);
 
     if (op.rt == 15) {
@@ -1524,7 +1575,7 @@ static void arm_memio_ldrb(arm_memio_t op) {
     arm_cycles_s_to_n();
 }
 
-static void arm_memio_ldrh(arm_memio_t op) {
+static inline void arm_memio_ldrh(arm_memio_t op) {
     arm_r.r[op.rt] = arm_readh_n(op.addr);
 
     if (op.rt == 15) {
@@ -1587,19 +1638,19 @@ static void arm_memio_ldrd(arm_memio_t op) {
     arm_cycles_s_to_n();
 }
 
-static void arm_memio_str(arm_memio_t op) {
+static inline void arm_memio_str(arm_memio_t op) {
     arm_write_n(op.addr, arm_memio_reg_get(op.rt));
 
     arm_cycles_s_to_n();
 }
 
-static void arm_memio_strb(arm_memio_t op) {
+static inline void arm_memio_strb(arm_memio_t op) {
     arm_writeb_n(op.addr, arm_memio_reg_get(op.rt));
 
     arm_cycles_s_to_n();
 }
 
-static void arm_memio_strh(arm_memio_t op) {
+static inline void arm_memio_strh(arm_memio_t op) {
     arm_writeh_n(op.addr, arm_memio_reg_get(op.rt));
 
     arm_cycles_s_to_n();
@@ -1867,7 +1918,7 @@ static arm_memio_t t16_memio_mult_op() {
     return op;
 }
 
-static arm_memio_t t16_memio_imm5_op(int8_t step) {
+static inline arm_memio_t t16_memio_imm5_op(int8_t step) {
     uint8_t rt  = (arm_op >> 0) & 0x7;
     uint8_t imm = (arm_op >> 6) & 0x1f;
     uint8_t rn  = (arm_op >> 3) & 0x7;
@@ -1882,7 +1933,7 @@ static arm_memio_t t16_memio_imm5_op(int8_t step) {
     return op;
 }
 
-static arm_memio_t t16_memio_imm8sp_op() {
+static inline arm_memio_t t16_memio_imm8sp_op() {
     uint16_t imm = (arm_op << 2) & 0x3fc;
     uint8_t  rt  = (arm_op >> 8) & 0x7;
 
@@ -1896,7 +1947,7 @@ static arm_memio_t t16_memio_imm8sp_op() {
     return op;
 }
 
-static arm_memio_t t16_memio_imm8pc_op() {
+static inline arm_memio_t t16_memio_imm8pc_op() {
     uint16_t imm = (arm_op << 2) & 0x3fc;
     uint8_t  rt  = (arm_op >> 8) & 0x7;
 
@@ -2063,7 +2114,7 @@ static void arm_shift_reg() {
 }
 
 //Arithmetic Shift Right
-static void t16_asr_imm5() {
+static inline void t16_asr_imm5() {
     arm_asr(t16_data_imm5_op(ARM_SHIFT_RIGHT));
 }
 
@@ -2081,9 +2132,21 @@ static void arm_b() {
     arm_r.r[15] += imm;
 
     arm_load_pipe();
+
+    // Idle-loop short-circuit: an ARM `b .` (target = current PC, i.e. a
+    // tight spin) is the cart waiting for an IRQ to wake it — semantically
+    // equivalent to SWI 0x02 (HALT). Set int_halt so the inner arm_exec
+    // loop ends this scanline; trigger_irq() in io/timer/dma will clear
+    // int_halt and dispatch the IRQ when one fires, exactly the same path
+    // SWI HALT uses. r[15] is left at the branch's natural post-execute
+    // value (== branch_pc + 8 in ARM pipeline), so saved_lr in
+    // hle_irq_enter resolves to branch_pc on return — control resumes on
+    // the branch and either re-spins until the next IRQ or falls through
+    // because the IRQ handler's side effect cleared the wait condition.
+    if (imm == -8) int_halt = true;
 }
 
-static void t16_b_imm11() {
+static inline void t16_b_imm11() {
     int32_t imm = arm_op;
 
     imm <<= 21;
@@ -2092,6 +2155,10 @@ static void t16_b_imm11() {
     arm_r.r[15] += imm;
 
     arm_load_pipe();
+
+    // Same idle-loop short-circuit as arm_b, for the Thumb encoding of
+    // `b .` (0xE7FE, imm == -4). See arm_b's comment for the rationale.
+    if (imm == -4) int_halt = true;
 }
 
 //Thumb Conditional Branches
@@ -2334,15 +2401,15 @@ static void arm_ldr_reg() {
     arm_memio_ldr(arm_memio_reg_op());
 }
 
-static void t16_ldr_imm5() {
+static inline void t16_ldr_imm5() {
     arm_memio_ldr(t16_memio_imm5_op(ARM_WORD_SZ));
 }
 
-static void t16_ldr_sp8() {
+static inline void t16_ldr_sp8() {
     arm_memio_ldr(t16_memio_imm8sp_op());
 }
 
-static void t16_ldr_pc8() {
+static inline void t16_ldr_pc8() {
     arm_memio_ldr(t16_memio_imm8pc_op());
 }
 
@@ -2429,7 +2496,7 @@ static void t16_ldrsh_reg() {
 }
 
 //Logical Shift Left
-static void t16_lsl_imm5() {
+static inline void t16_lsl_imm5() {
     arm_lsl(t16_data_imm5_op(ARM_SHIFT_LEFT));
 }
 
@@ -2438,7 +2505,7 @@ static void t16_lsl_rdn3() {
 }
 
 //Logical Shift Right
-static void t16_lsr_imm5() {
+static inline void t16_lsr_imm5() {
     arm_lsr(t16_data_imm5_op(ARM_SHIFT_RIGHT));
 }
 
@@ -2798,11 +2865,11 @@ static void arm_str_reg() {
     arm_memio_str(arm_memio_reg_op());
 }
 
-static void t16_str_imm5() {
+static inline void t16_str_imm5() {
     arm_memio_str(t16_memio_imm5_op(ARM_WORD_SZ));
 }
 
-static void t16_str_sp8() {
+static inline void t16_str_sp8() {
     arm_memio_str(t16_memio_imm8sp_op());
 }
 
@@ -3124,6 +3191,104 @@ static void hle_intr_wait(void) {
     int_halt = true;
 }
 
+// HLE'd BIOS IRQ entry / return.
+//
+// The standard GBA BIOS IRQ handler at 0x128 does a fixed sequence on
+// every interrupt:
+//
+//   STMFD SP!, {R0-R3, R12, LR}   ; push to IRQ stack
+//   MOV   R0, #0x04000000         ; IO base for the user handler
+//   ADR   LR, post_handler        ; return path inside BIOS
+//   LDR   PC, [R0, #-4]           ; jump to *(0x03007FFC) (cart handler)
+//   ;-- post_handler:
+//   LDMFD SP!, {R0-R3, R12, LR}
+//   SUBS  PC, LR, #4              ; restore CPSR from SPSR_irq + return
+//
+// The interpreter ran each of those ~10 instructions per IRQ, with a
+// chunk-cache miss for every BIOS-region fetch. On a workload with many
+// IRQs per frame (any game using IntrWait/VBlankIntrWait, plus HBlank/
+// timer IRQs), the wall-time cost was substantial.
+//
+// The HLE replicates the architecturally visible effects directly in C:
+// pushes the same six registers to R13_irq, sets R0/LR, jumps to the
+// cart handler. On return (detected by PC == HLE_IRQ_RETURN_PC, see
+// arm_load_pipe), it pops and restores CPSR. No bus traffic for the
+// BIOS instructions themselves, no chunk-cache pressure, no per-op
+// dispatch overhead.
+//
+// Bypassed only when the cart hasn't installed a handler yet
+// (*(0x03007FFC) == 0); arm_check_irq falls through to the original
+// arm_int(VEC_IRQ, IRQ) path so the BIOS still runs in that case
+// (and lets early-boot code that depends on the BIOS's null-check
+// behavior work).
+volatile uint32_t arm_hle_irq_count;
+
+static void hle_irq_enter(uint32_t handler_addr) {
+    // Mirror arm_int(VEC_IRQ, IRQ) for the state-save half: pack flags,
+    // snapshot CPSR, switch to IRQ mode, save SPSR_irq.
+    arm_flags_to_cpsr();
+    uint32_t cpsr_save = arm_r.cpsr;
+
+    // Compute the saved return-PC the same way arm_int(VEC_IRQ, IRQ) does:
+    //   ARM:   LR_irq = r[15] - 4
+    //   Thumb: LR_irq = r[15]
+    // (See the PC-adjust block in arm_int.)
+    uint32_t saved_lr = (cpsr_save & ARM_T)
+        ? arm_r.r[15]
+        : arm_r.r[15] - 4;
+
+    arm_mode_set(ARM_IRQ);
+    arm_spsr_set(cpsr_save);
+
+    // STMFD SP!, {R0-R3, R12, R14}: push 6 words to R13_irq.
+    // Stack grows down; on-stack order (low→high) is R0, R1, R2, R3, R12, LR.
+    arm_r.r[13] -= 24;
+    uint32_t sp = arm_r.r[13];
+    arm_write(sp +  0, arm_r.r[0]);
+    arm_write(sp +  4, arm_r.r[1]);
+    arm_write(sp +  8, arm_r.r[2]);
+    arm_write(sp + 12, arm_r.r[3]);
+    arm_write(sp + 16, arm_r.r[12]);
+    arm_write(sp + 20, saved_lr);
+
+    // Hand the user handler the same environment the BIOS would have:
+    // R0 = IO base, LR = "where to return to" (sentinel for our HLE path).
+    arm_r.r[0]  = 0x04000000;
+    arm_r.r[14] = HLE_IRQ_RETURN_PC;
+
+    // Force ARM mode for the handler (BIOS handler runs in ARM regardless
+    // of what mode the cart was in when interrupted) and disable IRQs.
+    arm_flag_set(ARM_T, false);
+    arm_flag_set(ARM_I, true);
+
+    arm_r.r[15] = handler_addr;
+    arm_hle_irq_count++;
+    arm_load_pipe();
+}
+
+static void hle_irq_return(void) {
+    // Mirror the BIOS post-handler:
+    //   LDMFD SP!, {R0-R3, R12, LR}
+    //   SUBS  PC, LR, #4
+    uint32_t sp = arm_r.r[13];
+    arm_r.r[0]  = arm_read(sp +  0);
+    arm_r.r[1]  = arm_read(sp +  4);
+    arm_r.r[2]  = arm_read(sp +  8);
+    arm_r.r[3]  = arm_read(sp + 12);
+    arm_r.r[12] = arm_read(sp + 16);
+    arm_r.r[14] = arm_read(sp + 20);
+    arm_r.r[13] = sp + 24;
+
+    uint32_t new_pc = arm_r.r[14] - 4;
+
+    // SUBS PC, LR, #4 with PC as destination + S flag = restore CPSR
+    // from SPSR_irq, then jump. arm_spsr_to_cpsr handles the mode
+    // switch + bank-register restore + lazy-NZCV resync.
+    arm_spsr_to_cpsr();
+    arm_r.r[15] = new_pc;
+    arm_r15_align();
+}
+
 static bool hle_swi(uint8_t swi_num) {
     arm_swi_last = swi_num;
     arm_swi_count[swi_num]++;
@@ -3265,140 +3430,201 @@ static void arm_proc_set(void (**arr)(), void (*proc)(), uint32_t op, uint32_t m
     }
 }
 
-void (*arm_proc[2][4096])();
+// ARM-mode dispatch tables — compressed.
+//
+// The original layout was `void (*arm_proc[2][4096])();` = 32 KB of
+// function pointers in main RAM. Out of 4096 possible 12-bit decode keys
+// per cond bank, only ~120 unique handlers exist; the rest are arm_und.
+// At 32 KB the table didn't fit in the SH4A's 16 KB OC, so steady-state
+// dispatch missed cache constantly.
+//
+// Compressed: a small handler-pointer array (1 byte index per slot) plus
+// two 4096-byte index tables. Total main-RAM footprint drops from 32 KB
+// to 8.5 KB, which fits comfortably in OC even with cart code/data
+// competing for cache lines. Per-dispatch cost goes from one 4-byte
+// pointer load (often a miss) to one 1-byte index load (hits OC) plus
+// one 4-byte handler-pointer load (always hot — only 480 bytes total
+// and accessed every dispatch, so guaranteed OC-resident).
+//
+// Index 0 is reserved for arm_und so the zero-initialized fill is
+// already correct.
+#define ARM_PROC_HANDLERS_MAX 128
+static void (*arm_proc_handlers[ARM_PROC_HANDLERS_MAX])();
+static uint8_t arm_proc_handlers_count;
+
+uint8_t arm_proc_idx_0[4096];   // typical conds (0..14)
+uint8_t arm_proc_idx_1[4096];   // cond=15 (UNCOND)
+
+static uint8_t arm_proc_register(void (*fn)()) {
+    // Linear dedupe — only ~120 unique handlers, called at init only.
+    for (int i = 0; i < arm_proc_handlers_count; i++) {
+        if (arm_proc_handlers[i] == fn) return (uint8_t)i;
+    }
+    uint8_t idx = arm_proc_handlers_count++;
+    arm_proc_handlers[idx] = fn;
+    return idx;
+}
+
+static void arm_proc_fill_c(uint8_t *arr, void (*proc)(), int32_t size) {
+    uint8_t idx = arm_proc_register(proc);
+    for (int32_t i = 0; i < size; i++) arr[i] = idx;
+}
+
+static void arm_proc_set_c(uint8_t *arr, void (*proc)(),
+                           uint32_t op, uint32_t mask, int32_t bits) {
+    uint8_t idx = arm_proc_register(proc);
+    int32_t zbits = 0;
+    int32_t zpos[bits];
+
+    for (int32_t i = 0; i < bits; i++) {
+        if ((mask & (1 << i)) == 0) zpos[zbits++] = i;
+    }
+
+    for (int32_t i = 0; i < (1 << zbits); i++) {
+        op &= mask;
+
+        for (int32_t j = 0; j < zbits; j++) {
+            op |= ((i >> j) & 1) << zpos[j];
+        }
+
+        arr[op] = idx;
+    }
+}
+
 // Thumb dispatch table in XYRAM: hit on every Thumb instruction, and Thumb
 // is the dominant mode in most GBA games. 2048 entries × 4 bytes = 8 KB,
 // fits comfortably in XYRAM (16 KB). Each lookup avoids a main-RAM bus
-// transaction (~117 MHz) on cache miss.
+// transaction (~117 MHz) on cache miss. Not compressed (XYRAM never
+// misses, so the indirection would only add a load).
 void (*thumb_proc[2048])() GXRAM;
 
 static void arm_proc_init() {
     //Format 27:20,7:4
-    arm_proc_fill(arm_proc[0], arm_und, 4096);
-    arm_proc_fill(arm_proc[1], arm_und, 4096);
+    arm_proc_fill_c(arm_proc_idx_0, arm_und, 4096);
+    arm_proc_fill_c(arm_proc_idx_1, arm_und, 4096);
 
     //Conditional
-    arm_proc_set(arm_proc[0], arm_adc_imm,    0b001010100000, 0b111111100000, 12);
-    arm_proc_set(arm_proc[0], arm_adc_regi,   0b000010100000, 0b111111100001, 12);
-    arm_proc_set(arm_proc[0], arm_adc_regr,   0b000010100001, 0b111111101001, 12);
-    arm_proc_set(arm_proc[0], arm_add_imm,    0b001010000000, 0b111111100000, 12);
-    arm_proc_set(arm_proc[0], arm_add_regi,   0b000010000000, 0b111111100001, 12);
-    arm_proc_set(arm_proc[0], arm_add_regr,   0b000010000001, 0b111111101001, 12);
-    arm_proc_set(arm_proc[0], arm_and_imm,    0b001000000000, 0b111111100000, 12);
-    arm_proc_set(arm_proc[0], arm_and_regi,   0b000000000000, 0b111111100001, 12);
-    arm_proc_set(arm_proc[0], arm_and_regr,   0b000000000001, 0b111111101001, 12);
-    arm_proc_set(arm_proc[0], arm_shift_imm,  0b000110100000, 0b111111100001, 12);
-    arm_proc_set(arm_proc[0], arm_shift_reg,  0b000110100001, 0b111111101001, 12);
-    arm_proc_set(arm_proc[0], arm_b,          0b101000000000, 0b111100000000, 12);
-    arm_proc_set(arm_proc[0], arm_bic_imm,    0b001111000000, 0b111111100000, 12);
-    arm_proc_set(arm_proc[0], arm_bic_regi,   0b000111000000, 0b111111100001, 12);
-    arm_proc_set(arm_proc[0], arm_bic_regr,   0b000111000001, 0b111111101001, 12);
-    arm_proc_set(arm_proc[0], arm_bkpt,       0b000100100111, 0b111111111111, 12);
-    arm_proc_set(arm_proc[0], arm_bl,         0b101100000000, 0b111100000000, 12);
-    arm_proc_set(arm_proc[0], arm_blx_reg,    0b000100100011, 0b111111111111, 12);
-    arm_proc_set(arm_proc[0], arm_bx,         0b000100100001, 0b111111111111, 12);
-    arm_proc_set(arm_proc[0], arm_cdp,        0b111000000000, 0b111100000001, 12);
-    arm_proc_set(arm_proc[0], arm_clz,        0b000101100001, 0b111111111111, 12);
-    arm_proc_set(arm_proc[0], arm_cmn_imm,    0b001101110000, 0b111111110000, 12);
-    arm_proc_set(arm_proc[0], arm_cmn_regi,   0b000101110000, 0b111111110001, 12);
-    arm_proc_set(arm_proc[0], arm_cmn_regr,   0b000101110001, 0b111111111001, 12);
-    arm_proc_set(arm_proc[0], arm_cmp_imm,    0b001101010000, 0b111111110000, 12);
-    arm_proc_set(arm_proc[0], arm_cmp_regi,   0b000101010000, 0b111111110001, 12);
-    arm_proc_set(arm_proc[0], arm_cmp_regr,   0b000101010001, 0b111111111001, 12);
-    arm_proc_set(arm_proc[0], arm_eor_imm,    0b001000100000, 0b111111100000, 12);
-    arm_proc_set(arm_proc[0], arm_eor_regi,   0b000000100000, 0b111111100001, 12);
-    arm_proc_set(arm_proc[0], arm_eor_regr,   0b000000100001, 0b111111101001, 12);
-    arm_proc_set(arm_proc[0], arm_ldc,        0b110000010000, 0b111000010000, 12);
-    arm_proc_set(arm_proc[0], arm_ldm,        0b100000010000, 0b111001010000, 12);
-    arm_proc_set(arm_proc[0], arm_ldm_usr,    0b100001010000, 0b111001010000, 12);
-    arm_proc_set(arm_proc[0], arm_ldr_imm,    0b010000010000, 0b111001010000, 12);
-    arm_proc_set(arm_proc[0], arm_ldr_reg,    0b011000010000, 0b111001010001, 12);
-    arm_proc_set(arm_proc[0], arm_ldrb_imm,   0b010001010000, 0b111001010000, 12);
-    arm_proc_set(arm_proc[0], arm_ldrb_reg,   0b011001010000, 0b111001010001, 12);
-    arm_proc_set(arm_proc[0], arm_ldrbt_imm,  0b010001110000, 0b111101110000, 12);
-    arm_proc_set(arm_proc[0], arm_ldrbt_reg,  0b011001110000, 0b111101110001, 12);
-    arm_proc_set(arm_proc[0], arm_ldrd_imm,   0b000001001101, 0b111001011111, 12);
-    arm_proc_set(arm_proc[0], arm_ldrd_reg,   0b000000001101, 0b111001011111, 12);
-    arm_proc_set(arm_proc[0], arm_ldrh_imm,   0b000001011011, 0b111001011111, 12);
-    arm_proc_set(arm_proc[0], arm_ldrh_reg,   0b000000011011, 0b111001011111, 12);
-    arm_proc_set(arm_proc[0], arm_ldrsb_imm,  0b000001011101, 0b111001011111, 12);
-    arm_proc_set(arm_proc[0], arm_ldrsb_reg,  0b000000011101, 0b111001011111, 12);
-    arm_proc_set(arm_proc[0], arm_ldrsh_imm,  0b000001011111, 0b111001011111, 12);
-    arm_proc_set(arm_proc[0], arm_ldrsh_reg,  0b000000011111, 0b111001011111, 12);
-    arm_proc_set(arm_proc[0], arm_mcr,        0b111000000001, 0b111100010001, 12);
-    arm_proc_set(arm_proc[0], arm_mcrr,       0b110001000000, 0b111111110000, 12);
-    arm_proc_set(arm_proc[0], arm_mla,        0b000000101001, 0b111111101111, 12);
-    arm_proc_set(arm_proc[0], arm_mov_imm12,  0b001110100000, 0b111111100000, 12);
-    arm_proc_set(arm_proc[0], arm_mrc,        0b111000010001, 0b111100010001, 12);
-    arm_proc_set(arm_proc[0], arm_mrrc,       0b110001010000, 0b111111110000, 12);
-    arm_proc_set(arm_proc[0], arm_mrs,        0b000100000000, 0b111110111111, 12);
-    arm_proc_set(arm_proc[0], arm_msr_imm,    0b001100100000, 0b111111110000, 12);
-    arm_proc_set(arm_proc[0], arm_msr_reg,    0b000100100000, 0b111110111111, 12);
-    arm_proc_set(arm_proc[0], arm_mul,        0b000000001001, 0b111111101111, 12);
-    arm_proc_set(arm_proc[0], arm_mvn_imm,    0b001111100000, 0b111111100000, 12);
-    arm_proc_set(arm_proc[0], arm_mvn_regi,   0b000111100000, 0b111111100001, 12);
-    arm_proc_set(arm_proc[0], arm_mvn_regr,   0b000111100001, 0b111111101001, 12);
-    arm_proc_set(arm_proc[0], arm_orr_imm,    0b001110000000, 0b111111100000, 12);
-    arm_proc_set(arm_proc[0], arm_orr_regi,   0b000110000000, 0b111111100001, 12);
-    arm_proc_set(arm_proc[0], arm_orr_regr,   0b000110000001, 0b111111101001, 12);
-    arm_proc_set(arm_proc[0], arm_qadd,       0b000100000101, 0b111111111111, 12);
-    arm_proc_set(arm_proc[0], arm_qdadd,      0b000101000101, 0b111111111111, 12);
-    arm_proc_set(arm_proc[0], arm_qdsub,      0b000101100101, 0b111111111111, 12);
-    arm_proc_set(arm_proc[0], arm_qsub,       0b000100100101, 0b111111111111, 12);
-    arm_proc_set(arm_proc[0], arm_rsb_imm,    0b001001100000, 0b111111100000, 12);
-    arm_proc_set(arm_proc[0], arm_rsb_regi,   0b000001100000, 0b111111100001, 12);
-    arm_proc_set(arm_proc[0], arm_rsb_regr,   0b000001100001, 0b111111101001, 12);
-    arm_proc_set(arm_proc[0], arm_rsc_imm,    0b001011100000, 0b111111100000, 12);
-    arm_proc_set(arm_proc[0], arm_rsc_regi,   0b000011100000, 0b111111100001, 12);
-    arm_proc_set(arm_proc[0], arm_rsc_regr,   0b000011100001, 0b111111101001, 12);
-    arm_proc_set(arm_proc[0], arm_sbc_imm,    0b001011000000, 0b111111100000, 12);
-    arm_proc_set(arm_proc[0], arm_sbc_regi,   0b000011000000, 0b111111100001, 12);
-    arm_proc_set(arm_proc[0], arm_sbc_regr,   0b000011000001, 0b111111101001, 12);
-    arm_proc_set(arm_proc[0], arm_smla__,     0b000100001000, 0b111111111001, 12);
-    arm_proc_set(arm_proc[0], arm_smlal,      0b000011101001, 0b111111101111, 12);
-    arm_proc_set(arm_proc[0], arm_smlal__,    0b000101001000, 0b111111111001, 12);
-    arm_proc_set(arm_proc[0], arm_smlaw_,     0b000100101000, 0b111111111011, 12);
-    arm_proc_set(arm_proc[0], arm_smul,       0b000101101000, 0b111111111001, 12);
-    arm_proc_set(arm_proc[0], arm_smull,      0b000011001001, 0b111111101111, 12);
-    arm_proc_set(arm_proc[0], arm_smulw_,     0b000100101010, 0b111111111011, 12);
-    arm_proc_set(arm_proc[0], arm_stc,        0b110000000000, 0b111000010000, 12);
-    arm_proc_set(arm_proc[0], arm_stm,        0b100000000000, 0b111001010000, 12);
-    arm_proc_set(arm_proc[0], arm_stm_usr,    0b100001000000, 0b111001010000, 12);
-    arm_proc_set(arm_proc[0], arm_str_imm,    0b010000000000, 0b111001010000, 12);
-    arm_proc_set(arm_proc[0], arm_str_reg,    0b011000000000, 0b111001010001, 12);
-    arm_proc_set(arm_proc[0], arm_strb_imm,   0b010001000000, 0b111001010000, 12);
-    arm_proc_set(arm_proc[0], arm_strb_reg,   0b011001000000, 0b111001010001, 12);
-    arm_proc_set(arm_proc[0], arm_strbt_imm,  0b010001100000, 0b111101110000, 12);
-    arm_proc_set(arm_proc[0], arm_strbt_reg,  0b011001100000, 0b111101110001, 12);
-    arm_proc_set(arm_proc[0], arm_strd_imm,   0b000001001111, 0b111001011111, 12);
-    arm_proc_set(arm_proc[0], arm_strd_reg,   0b000000001111, 0b111001011111, 12);
-    arm_proc_set(arm_proc[0], arm_strh_imm,   0b000001001011, 0b111001011111, 12);
-    arm_proc_set(arm_proc[0], arm_strh_reg,   0b000000001011, 0b111001011111, 12);
-    arm_proc_set(arm_proc[0], arm_sub_imm,    0b001001000000, 0b111111100000, 12);
-    arm_proc_set(arm_proc[0], arm_sub_regi,   0b000001000000, 0b111111100001, 12);
-    arm_proc_set(arm_proc[0], arm_sub_regr,   0b000001000001, 0b111111101001, 12);
-    arm_proc_set(arm_proc[0], arm_svc,        0b111100000000, 0b111100000000, 12);
-    arm_proc_set(arm_proc[0], arm_swp,        0b000100001001, 0b111110111111, 12);
-    arm_proc_set(arm_proc[0], arm_teq_imm,    0b001100110000, 0b111111110000, 12);
-    arm_proc_set(arm_proc[0], arm_teq_regi,   0b000100110000, 0b111111110001, 12);
-    arm_proc_set(arm_proc[0], arm_teq_regr,   0b000100110001, 0b111111111001, 12);
-    arm_proc_set(arm_proc[0], arm_tst_imm,    0b001100010000, 0b111111110000, 12);
-    arm_proc_set(arm_proc[0], arm_tst_regi,   0b000100010000, 0b111111110001, 12);
-    arm_proc_set(arm_proc[0], arm_tst_regr,   0b000100010001, 0b111111111001, 12);
-    arm_proc_set(arm_proc[0], arm_umlal,      0b000010101001, 0b111111101111, 12);
-    arm_proc_set(arm_proc[0], arm_umull,      0b000010001001, 0b111111101111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_adc_imm,    0b001010100000, 0b111111100000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_adc_regi,   0b000010100000, 0b111111100001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_adc_regr,   0b000010100001, 0b111111101001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_add_imm,    0b001010000000, 0b111111100000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_add_regi,   0b000010000000, 0b111111100001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_add_regr,   0b000010000001, 0b111111101001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_and_imm,    0b001000000000, 0b111111100000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_and_regi,   0b000000000000, 0b111111100001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_and_regr,   0b000000000001, 0b111111101001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_shift_imm,  0b000110100000, 0b111111100001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_shift_reg,  0b000110100001, 0b111111101001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_b,          0b101000000000, 0b111100000000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_bic_imm,    0b001111000000, 0b111111100000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_bic_regi,   0b000111000000, 0b111111100001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_bic_regr,   0b000111000001, 0b111111101001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_bkpt,       0b000100100111, 0b111111111111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_bl,         0b101100000000, 0b111100000000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_blx_reg,    0b000100100011, 0b111111111111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_bx,         0b000100100001, 0b111111111111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_cdp,        0b111000000000, 0b111100000001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_clz,        0b000101100001, 0b111111111111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_cmn_imm,    0b001101110000, 0b111111110000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_cmn_regi,   0b000101110000, 0b111111110001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_cmn_regr,   0b000101110001, 0b111111111001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_cmp_imm,    0b001101010000, 0b111111110000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_cmp_regi,   0b000101010000, 0b111111110001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_cmp_regr,   0b000101010001, 0b111111111001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_eor_imm,    0b001000100000, 0b111111100000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_eor_regi,   0b000000100000, 0b111111100001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_eor_regr,   0b000000100001, 0b111111101001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldc,        0b110000010000, 0b111000010000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldm,        0b100000010000, 0b111001010000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldm_usr,    0b100001010000, 0b111001010000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldr_imm,    0b010000010000, 0b111001010000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldr_reg,    0b011000010000, 0b111001010001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldrb_imm,   0b010001010000, 0b111001010000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldrb_reg,   0b011001010000, 0b111001010001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldrbt_imm,  0b010001110000, 0b111101110000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldrbt_reg,  0b011001110000, 0b111101110001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldrd_imm,   0b000001001101, 0b111001011111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldrd_reg,   0b000000001101, 0b111001011111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldrh_imm,   0b000001011011, 0b111001011111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldrh_reg,   0b000000011011, 0b111001011111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldrsb_imm,  0b000001011101, 0b111001011111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldrsb_reg,  0b000000011101, 0b111001011111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldrsh_imm,  0b000001011111, 0b111001011111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_ldrsh_reg,  0b000000011111, 0b111001011111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_mcr,        0b111000000001, 0b111100010001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_mcrr,       0b110001000000, 0b111111110000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_mla,        0b000000101001, 0b111111101111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_mov_imm12,  0b001110100000, 0b111111100000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_mrc,        0b111000010001, 0b111100010001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_mrrc,       0b110001010000, 0b111111110000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_mrs,        0b000100000000, 0b111110111111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_msr_imm,    0b001100100000, 0b111111110000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_msr_reg,    0b000100100000, 0b111110111111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_mul,        0b000000001001, 0b111111101111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_mvn_imm,    0b001111100000, 0b111111100000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_mvn_regi,   0b000111100000, 0b111111100001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_mvn_regr,   0b000111100001, 0b111111101001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_orr_imm,    0b001110000000, 0b111111100000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_orr_regi,   0b000110000000, 0b111111100001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_orr_regr,   0b000110000001, 0b111111101001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_qadd,       0b000100000101, 0b111111111111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_qdadd,      0b000101000101, 0b111111111111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_qdsub,      0b000101100101, 0b111111111111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_qsub,       0b000100100101, 0b111111111111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_rsb_imm,    0b001001100000, 0b111111100000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_rsb_regi,   0b000001100000, 0b111111100001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_rsb_regr,   0b000001100001, 0b111111101001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_rsc_imm,    0b001011100000, 0b111111100000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_rsc_regi,   0b000011100000, 0b111111100001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_rsc_regr,   0b000011100001, 0b111111101001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_sbc_imm,    0b001011000000, 0b111111100000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_sbc_regi,   0b000011000000, 0b111111100001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_sbc_regr,   0b000011000001, 0b111111101001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_smla__,     0b000100001000, 0b111111111001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_smlal,      0b000011101001, 0b111111101111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_smlal__,    0b000101001000, 0b111111111001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_smlaw_,     0b000100101000, 0b111111111011, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_smul,       0b000101101000, 0b111111111001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_smull,      0b000011001001, 0b111111101111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_smulw_,     0b000100101010, 0b111111111011, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_stc,        0b110000000000, 0b111000010000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_stm,        0b100000000000, 0b111001010000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_stm_usr,    0b100001000000, 0b111001010000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_str_imm,    0b010000000000, 0b111001010000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_str_reg,    0b011000000000, 0b111001010001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_strb_imm,   0b010001000000, 0b111001010000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_strb_reg,   0b011001000000, 0b111001010001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_strbt_imm,  0b010001100000, 0b111101110000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_strbt_reg,  0b011001100000, 0b111101110001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_strd_imm,   0b000001001111, 0b111001011111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_strd_reg,   0b000000001111, 0b111001011111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_strh_imm,   0b000001001011, 0b111001011111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_strh_reg,   0b000000001011, 0b111001011111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_sub_imm,    0b001001000000, 0b111111100000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_sub_regi,   0b000001000000, 0b111111100001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_sub_regr,   0b000001000001, 0b111111101001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_svc,        0b111100000000, 0b111100000000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_swp,        0b000100001001, 0b111110111111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_teq_imm,    0b001100110000, 0b111111110000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_teq_regi,   0b000100110000, 0b111111110001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_teq_regr,   0b000100110001, 0b111111111001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_tst_imm,    0b001100010000, 0b111111110000, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_tst_regi,   0b000100010000, 0b111111110001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_tst_regr,   0b000100010001, 0b111111111001, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_umlal,      0b000010101001, 0b111111101111, 12);
+    arm_proc_set_c(arm_proc_idx_0, arm_umull,      0b000010001001, 0b111111101111, 12);
 
     //Unconditional
-    arm_proc_set(arm_proc[1], arm_blx_imm,    0b101000000000, 0b111000000000, 12);
-    arm_proc_set(arm_proc[1], arm_cdp2,       0b111000000000, 0b111100000001, 12);
-    arm_proc_set(arm_proc[1], arm_ldc2,       0b110000010000, 0b111000010000, 12);
-    arm_proc_set(arm_proc[1], arm_mcr2,       0b111000000001, 0b111100010001, 12);
-    arm_proc_set(arm_proc[1], arm_mcrr2,      0b110001000000, 0b111111110000, 12);
-    arm_proc_set(arm_proc[1], arm_mrc2,       0b111000010001, 0b111100010001, 12);
-    arm_proc_set(arm_proc[1], arm_mrrc2,      0b110001010000, 0b111111110000, 12);
-    arm_proc_set(arm_proc[1], arm_pld_imm,    0b010101010000, 0b111101110000, 12);
-    arm_proc_set(arm_proc[1], arm_pld_reg,    0b011101010000, 0b111101110000, 12);
-    arm_proc_set(arm_proc[1], arm_stc2,       0b110000000000, 0b111000010000, 12);
+    arm_proc_set_c(arm_proc_idx_1, arm_blx_imm,    0b101000000000, 0b111000000000, 12);
+    arm_proc_set_c(arm_proc_idx_1, arm_cdp2,       0b111000000000, 0b111100000001, 12);
+    arm_proc_set_c(arm_proc_idx_1, arm_ldc2,       0b110000010000, 0b111000010000, 12);
+    arm_proc_set_c(arm_proc_idx_1, arm_mcr2,       0b111000000001, 0b111100010001, 12);
+    arm_proc_set_c(arm_proc_idx_1, arm_mcrr2,      0b110001000000, 0b111111110000, 12);
+    arm_proc_set_c(arm_proc_idx_1, arm_mrc2,       0b111000010001, 0b111100010001, 12);
+    arm_proc_set_c(arm_proc_idx_1, arm_mrrc2,      0b110001010000, 0b111111110000, 12);
+    arm_proc_set_c(arm_proc_idx_1, arm_pld_imm,    0b010101010000, 0b111101110000, 12);
+    arm_proc_set_c(arm_proc_idx_1, arm_pld_reg,    0b011101010000, 0b111101110000, 12);
+    arm_proc_set_c(arm_proc_idx_1, arm_stc2,       0b110000000000, 0b111000010000, 12);
 }
 
 static void thumb_proc_init() {
@@ -3525,17 +3751,31 @@ static inline void t16_step() {
 
     // Inline fast paths for the most common Thumb opcodes that can be
     // identified by their top 5 bits alone. The handlers and their
-    // helpers (t16_data_imm8_op, arm_arith_*, etc.) are static inline,
+    // helpers (t16_data_imm8_op, arm_memio_imm5_op, arm_arith_*,
+    // arm_lsl/lsr/asr, arm_memio_ldr/str, etc.) are static inline,
     // so the compiler folds them in here, eliminating the function-call
-    // overhead and indirect dispatch through thumb_proc[].
+    // overhead, the per-op operand decode call, and the indirect
+    // dispatch through thumb_proc[]. Per-op savings are ~5-15 SH4A
+    // cycles depending on the handler's body size; on Thumb-dominant
+    // games (Minish Cap, Pokémon, etc.) the dispatch itself becomes
+    // straight-line code with no function-call boundaries.
     //
     // Non-matching opcodes fall through to the existing function-pointer
     // dispatch.
     switch (arm_op >> 11) {
+        case 0b00000: t16_lsl_imm5();  break;  // LSL  Rd, Rm, #imm5
+        case 0b00001: t16_lsr_imm5();  break;  // LSR  Rd, Rm, #imm5
+        case 0b00010: t16_asr_imm5();  break;  // ASR  Rd, Rm, #imm5
         case 0b00100: t16_mov_imm();   break;  // MOV  Rd, #imm8
         case 0b00101: t16_cmp_imm8();  break;  // CMP  Rd, #imm8
         case 0b00110: t16_add_imm8();  break;  // ADD  Rd, #imm8
         case 0b00111: t16_sub_imm8();  break;  // SUB  Rd, #imm8
+        case 0b01001: t16_ldr_pc8();   break;  // LDR  Rd, [PC, #imm8] (constant pool)
+        case 0b01100: t16_str_imm5();  break;  // STR  Rd, [Rn, #imm5]
+        case 0b01101: t16_ldr_imm5();  break;  // LDR  Rd, [Rn, #imm5]
+        case 0b10010: t16_str_sp8();   break;  // STR  Rd, [SP, #imm8]
+        case 0b10011: t16_ldr_sp8();   break;  // LDR  Rd, [SP, #imm8]
+        case 0b11100: t16_b_imm11();   break;  // B    #imm11 (uncond branch)
         default:      thumb_proc[arm_op >> 5]();
     }
 
@@ -3563,12 +3803,16 @@ static inline void arm_step() {
     // unconditionally executed at the per-instruction granularity. Skip the
     // arm_cond() call entirely for that case. cond == 15 is the
     // "unconditional" form (a few instructions like BLX have this encoding).
+    //
+    // Compressed dispatch: arm_proc_idx_*[proc] returns a 1-byte index
+    // into arm_proc_handlers[] (the actual function pointer). See the
+    // table-definition block for why this wins.
     if (cond == 14) {
-        arm_proc[0][proc]();
+        arm_proc_handlers[arm_proc_idx_0[proc]]();
     } else if (cond == ARM_COND_UNCOND) {
-        arm_proc[1][proc]();
+        arm_proc_handlers[arm_proc_idx_1[proc]]();
     } else if (arm_cond(cond)) {
-        arm_proc[0][proc]();
+        arm_proc_handlers[arm_proc_idx_0[proc]]();
     }
 
     arm_inc_r15();
@@ -3591,6 +3835,24 @@ volatile uint8_t  arm_first_low_set;
 volatile uint32_t arm_swi_count[256];
 volatile uint8_t  arm_swi_last;
 
+// Place the inner dispatch loop into ILRAM (4 KB on-chip code RAM, 0-wait,
+// never evicted from I-cache). t16_step and arm_step are static inline and
+// fold into arm_exec at -O3 -flto, as do the per-opcode fast paths in
+// t16_step's switch — so the entire steady-state Thumb dispatch body lands
+// in ILRAM. Out-of-line handlers reached via thumb_proc[]/arm_proc_handlers[]
+// stay in .text. .ilram is 4 KB; arm_exec is ~1.5 KB after inlining, leaving
+// headroom for placing more hot code (arm_check_irq, arm_load_pipe) later.
+//
+// We use .gint.mapped (gint's "ax" section also placed in ILRAM by the
+// fxcg50 linker script) rather than the GILRAM macro's .ilram, because
+// .ilram is already populated with data (e.g. gint's ILbuf) and putting
+// code there would trigger a section-type conflict at link time.
+//
+// gint_set_onchip_save_mode(BACKUP) in main.c covers the entire ILRAM
+// region across world switches, so chunk-load fread can still happen
+// without trashing the dispatch code.
+#define ILRAM_CODE __attribute__((section(".gint.mapped")))
+void arm_exec(uint32_t target_cycles) ILRAM_CODE;
 void arm_exec(uint32_t target_cycles) {
     if (int_halt) {
         timers_clock(target_cycles);
@@ -3685,8 +3947,20 @@ void arm_int(uint32_t address, int8_t mode) {
 void arm_check_irq() {
     if (!arm_flag_tst(ARM_I) &&
         (int_enb_m.w & 1) &&
-        (int_enb.w & int_ack.w))
+        (int_enb.w & int_ack.w)) {
+        // Read the cart's installed user-IRQ handler from 0x03007FFC.
+        // If non-zero, take the HLE'd entry path that skips the BIOS's
+        // ~10-instruction prologue/epilogue. If zero, fall through to
+        // the original arm_int(VEC_IRQ, IRQ) so the BIOS's null-check
+        // / dispatcher can run as it would on real hardware (matters
+        // during early-boot frames before the cart sets the pointer).
+        uint32_t handler = arm_read(0x03007FFC);
+        if (handler) {
+            hle_irq_enter(handler);
+            return;
+        }
         arm_int(ARM_VEC_IRQ, ARM_IRQ);
+    }
 }
 
 void arm_reset() {

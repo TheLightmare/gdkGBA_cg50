@@ -351,7 +351,10 @@ int main(void) {
     uint32_t loop_frame = 0;
     int dumps_done = 0;
     int spike_dumps = 0;
+    int manual_dumps = 0;
     uint32_t last_spike_frame = 0;
+    bool f3_was_down = false;
+    bool capture_now_pending = false;
     // Steady-state runs ~90 ms/frame on Ptune4 F5; flag anything over 200 ms
     // as a spike worth investigating. Cap spike snapshots aggressively and
     // require a frame gap between captures: a fade animation generates one
@@ -360,6 +363,7 @@ int main(void) {
     const uint32_t SPIKE_THRESHOLD_US = 200000;
     const int MAX_SPIKE_DUMPS = 5;
     const uint32_t SPIKE_MIN_GAP = 30;
+    const int MAX_MANUAL_DUMPS = 20;
 
     while (run) {
         // Capture per-frame timing BEFORE run_frame so we can compute the
@@ -379,6 +383,9 @@ int main(void) {
         uint32_t frame_us = bench_freq_hz
             ? (uint32_t)((uint64_t)bench_elapsed(frame_t0) * 1000000ULL / bench_freq_hz)
             : 0;
+        // Publish for the on-screen heartbeat overlay (lets the user
+        // visually compare what bench thinks vs. what they perceive).
+        bench_last_frame_us = frame_us;
 
         clearevents();
 
@@ -386,6 +393,16 @@ int main(void) {
             run = false;
             continue;
         }
+
+        // F3 = manual bench snapshot. Edge-detect so a held key only
+        // captures once. Use this to grab a log mid-gameplay where the
+        // scheduled snapshots can't reach (e.g., past frame 3600, or in
+        // a specific scene that's slow).
+        bool f3_now = keydown(KEY_F3);
+        if (f3_now && !f3_was_down && manual_dumps < MAX_MANUAL_DUMPS) {
+            capture_now_pending = true;
+        }
+        f3_was_down = f3_now;
 
         uint16_t pressed = 0;
         if (keydown(KEY_UP))    pressed |= BTN_U;
@@ -412,7 +429,8 @@ int main(void) {
         // avoid log spam if the slowdown is sustained.
         loop_frame++;
         static const uint32_t snapshot_frames[] = {
-            1, 5, 30, 60, 120, 240, 480, 900, 1500, 2400, 3600
+            1, 5, 30, 60, 120, 240, 480, 900, 1500, 2400, 3600,
+            5400, 7200, 10800
         };
         const int SNAPSHOT_FRAMES_COUNT =
             (int)(sizeof(snapshot_frames) / sizeof(snapshot_frames[0]));
@@ -428,7 +446,9 @@ int main(void) {
                      && (frame_us > SPIKE_THRESHOLD_US)
                      && (spike_dumps < MAX_SPIKE_DUMPS)
                      && (loop_frame - last_spike_frame >= SPIKE_MIN_GAP);
-        if (is_scheduled || is_spike) {
+        bool is_manual = capture_now_pending && !is_scheduled && !is_spike;
+        capture_now_pending = false;
+        if (is_scheduled || is_spike || is_manual) {
             char buf[1280];
             int n = 0;
             arm_flags_to_cpsr();
@@ -436,6 +456,11 @@ int main(void) {
                 n += snprintf(buf + n, sizeof(buf) - n,
                     "--- SPIKE %d (frame %lu, this frame=%lu us) ---\n",
                     spike_dumps, (unsigned long)loop_frame,
+                    (unsigned long)frame_us);
+            } else if (is_manual) {
+                n += snprintf(buf + n, sizeof(buf) - n,
+                    "--- MANUAL %d (frame %lu, this frame=%lu us) ---\n",
+                    manual_dumps, (unsigned long)loop_frame,
                     (unsigned long)frame_us);
             } else {
                 n += snprintf(buf + n, sizeof(buf) - n,
@@ -495,6 +520,7 @@ int main(void) {
             extern volatile uint8_t  arm_first_low_was_thumb;
             extern volatile uint32_t arm_swi_count[256];
             extern volatile uint8_t  arm_swi_last;
+            extern volatile uint32_t arm_hle_irq_count;
 
             // Read what BIOS will fetch as the user IRQ handler address.
             // The BIOS at 0x134 does LDR pc,[0x03FFFFFC], and that mirrors
@@ -532,6 +558,9 @@ int main(void) {
                 (unsigned long)arm_swi_count[0x13],
                 (unsigned long)arm_swi_count[0x14],
                 (unsigned long)arm_swi_count[0x15]);
+            n += snprintf(buf + n, sizeof(buf) - n,
+                "HLE IRQ entries (cumulative): %lu\n",
+                (unsigned long)arm_hle_irq_count);
             n += snprintf(buf + n, sizeof(buf) - n, "PC trace (newest last):\n");
             uint32_t start = arm_pc_trace_pos > 16
                 ? arm_pc_trace_pos - 16 : 0;
@@ -619,6 +648,7 @@ int main(void) {
                     spike_dumps++;
                     last_spike_frame = loop_frame;
                 }
+                if (is_manual) manual_dumps++;
             }
         }
     }

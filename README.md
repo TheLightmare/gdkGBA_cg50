@@ -14,10 +14,14 @@ button input, and play. As of the latest changes:
 - ✅ Mario Kart Super Circuit reaches its title screen, takes input
 - ✅ Zelda Minish Cap runs through title, save select, and gameplay
 - ✅ Real game graphics (BG layers, OBJ, palette) render correctly
-- ⚠️ Performance: ~10-12 fps steady, ~7 fps in heavy gameplay scenes
-  with frameskip=1 (target: 60 fps real GBA). **Ptune4 F5 preset is
-  effectively required** — the SH4A is bus-bound, so CPU-only overclocks
-  (Ptune3) don't help; the F5 preset's bus overclock does.
+- ⚠️ Performance: roughly **3-5 fps in gameplay**, single-digit fps
+  in cutscenes/fades, with frameskip=1 (target: 60 fps real GBA). The
+  emulator runs at about 5% of real GBA speed. **Ptune4 F5 preset
+  is effectively required** — the SH4A is bus-bound, so CPU-only
+  overclocks (Ptune3) don't help; F5's bus overclock does.
+  (NB: the in-tree benchmark currently over-reports fps by ~4× due
+  to a `clock_freq()` calibration bug; see
+  [`docs/PERFORMANCE_LOG.md`](docs/PERFORMANCE_LOG.md).)
 - ❌ Audio not supported (it eats through performance, so i probably will not support it at all)
 - ❌ Save persistence (EEPROM/SRAM/Flash) lost on add-in exit
 - ❌ Some games with full 256 KB EWRAM may corrupt without OS ≤ 03.06
@@ -125,9 +129,13 @@ Highlights of the development:
       base addresses, and palette flags 8× per tile. Restructured to
       walk tile-by-tile, doing setup once per 8 pixels. ~46 % off
       render time in steady state.
-    - **Net result**: roughly **3 fps → 12 fps** steady, **~7 fps**
-      in heavy gameplay scenes. Bench breakdown at snap-4 steady-state:
-      arm_exec 60 ms, render 14 ms, dupdate 5.5 ms = ~80 ms/frame.
+    - **Net result**: a meaningful relative improvement (each
+      individual optimization measurably reduced its target's
+      contribution), but absolute performance is still single-digit
+      fps in real gameplay. The full chronology, including the
+      bench-calibration mistake that initially made the numbers look
+      better than they were, is in
+      [`docs/PERFORMANCE_LOG.md`](docs/PERFORMANCE_LOG.md).
 
 A French translation of the log is available at
 [`docs/PORT_LOG.fr.md`](docs/PORT_LOG.fr.md).
@@ -159,12 +167,16 @@ you can see what the emulator decided.
 
 ## Performance
 
-Currently ~10-12 fps in steady state and ~7 fps in heavy gameplay scenes
-on Zelda Minish Cap with `FRAMESKIP=1` (the default), running at Ptune4
-F5 (CPU 232 MHz / Bus 58 MHz on default CG50). **The bus-bound diagnosis
-matters here**: stock CG50 (Ptune off) and Ptune3 (CPU-only OC) give
-similar performance; only Ptune4 F5's bus overclock helps because the
-emulator spends most cycles on bus stalls, not CPU work.
+Currently roughly 3-5 fps in real gameplay, single-digit fps in
+cutscenes and fade-heavy scenes, with `FRAMESKIP=1` (the default) on
+Zelda Minish Cap, running at Ptune4 F5 or higher (the emulator is
+bus-bound: stock CG50 and Ptune3 (CPU-only OC) give similar
+performance; only Ptune4 F5+'s bus overclock helps).
+
+The full performance investigation is documented in
+[`docs/PERFORMANCE_LOG.md`](docs/PERFORMANCE_LOG.md), including a
+caveat that the in-tree bench is currently miscalibrated and
+over-reports fps by ~4×.
 
 The compile flags are tuned per-file: `arm.c` at `-O3`, the other hot
 files (`arm_mem.c`, `rom_buffer.c`, `video.c`, `io.c`, `dma.c`,
@@ -190,13 +202,20 @@ vs. render-bound vs. chunk-thrashing.
 
 ## Known limitations
 
-- Performance is far from real-time. ~15-20 % of full GBA speed at
-  Ptune4 F5; lower without bus overclock.
+- Performance is far from real-time. ~5 % of full GBA speed in
+  gameplay even at Ptune4 F5+; lower without bus overclock.
 - No audio output.
 - Save data is lost on exit. Should be persisted to a sidecar file.
 - Newer Casio OSes (≥ 03.07) reserve the `extram` region; on those, we
   alias EWRAM and some games corrupt their state.
 - No ROM-select menu; the first `.gba` file alphabetically is used.
+- Some video features are unemulated: alpha blending (BLDCNT/BLDALPHA),
+  brightness fade (BLDY), mosaic, OBJ window, HDMA-driven scanline
+  effects. Cutscenes that rely on these display incorrectly (e.g.,
+  Zelda Minish Cap's Picori intro is missing its dialog text).
+- The built-in bench timer over-reports fps by ~4× due to
+  `clock_freq()` returning stale values when Ptune is set externally;
+  fix is to call `cpg_compute_freq()` in `bench_init`.
 - Bus-bound on the SH4A means further perf gains require either
   reducing per-instruction main-RAM accesses (decoded interpreter cache,
   JIT) or running on the rare CG50 variants with faster bus.

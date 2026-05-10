@@ -25,6 +25,11 @@ extern uint64_t bench_arm_exec_ticks;
 extern uint64_t bench_render_ticks;
 extern uint64_t bench_dupdate_ticks;
 
+// Last frame's measured wall time (microseconds). Updated each frame in
+// main.c so the heartbeat overlay can display "what the bench thinks the
+// fps is" alongside the user's visual perception.
+extern uint32_t bench_last_frame_us;
+
 // Frequency of the bench timer in Hz (so callers can convert to µs).
 // 0 if no TMU could be reserved.
 extern uint32_t bench_freq_hz;

@@ -88,6 +88,23 @@ uint32_t rom_buffer_read_32(RomBuffer* buffer, uint32_t address);
 // Caller invariant: address is aligned (2-byte for _16, 4-byte for _32).
 // Aligned reads in 64 KB chunks never span a chunk boundary so we don't
 // need the per-byte assembly that the slow path uses near boundaries.
+//
+// Bus-traffic optimization: on big-endian hosts (SH4A on the CG50)
+// chunks are stored byteswapped at load time (see load_chunk in rom_buffer.c).
+// That means a native 32-bit aligned load directly yields the GBA's
+// little-endian-decoded word — one bus transaction instead of four byte
+// loads + shifts/ORs. On a little-endian host, no swap is needed and a
+// native load gives the same result. The only address munging is for
+// sub-word reads on BE hosts: byte at original offset N is at swapped
+// offset N^3, halfword at N is at swapped offset N^2.
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#  define ROM_BYTE_OFF_XOR  3u
+#  define ROM_HALF_OFF_XOR  2u
+#else
+#  define ROM_BYTE_OFF_XOR  0u
+#  define ROM_HALF_OFF_XOR  0u
+#endif
+
 static inline uint16_t rom_buffer_read_16_fast(RomBuffer *buffer,
                                                uint32_t address)
 {
@@ -95,8 +112,8 @@ static inline uint16_t rom_buffer_read_16_fast(RomBuffer *buffer,
             (address & ~(ROM_CHUNK_SIZE - 1)) == buffer->last_chunk_address &&
             buffer->last_chunk_idx >= 0, 1)) {
         const uint8_t *p = buffer->chunk_buffers[buffer->last_chunk_idx] +
-                           (address & (ROM_CHUNK_SIZE - 1));
-        return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+                           ((address & (ROM_CHUNK_SIZE - 1)) ^ ROM_HALF_OFF_XOR);
+        return *(const uint16_t *)p;
     }
     return rom_buffer_read_16(buffer, address);
 }
@@ -109,10 +126,7 @@ static inline uint32_t rom_buffer_read_32_fast(RomBuffer *buffer,
             buffer->last_chunk_idx >= 0, 1)) {
         const uint8_t *p = buffer->chunk_buffers[buffer->last_chunk_idx] +
                            (address & (ROM_CHUNK_SIZE - 1));
-        return  (uint32_t)p[0]        |
-               ((uint32_t)p[1] <<  8) |
-               ((uint32_t)p[2] << 16) |
-               ((uint32_t)p[3] << 24);
+        return *(const uint32_t *)p;
     }
     return rom_buffer_read_32(buffer, address);
 }

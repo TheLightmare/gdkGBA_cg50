@@ -48,6 +48,27 @@ static int do_chunk_io(struct chunk_io_args *a) {
     return 0;
 }
 
+// Big-endian-host post-load step: chunks come off disk in little-endian
+// (GBA storage order). To let arm_fetch / rom_buffer_read_*_fast use
+// native 32-bit loads — one bus transaction instead of four byte loads
+// plus shifts/ORs — we byteswap each 4-byte word in place. After this,
+// a native BE word load at offset 0 of any aligned word yields exactly
+// the LE-decoded value the guest expects.
+//
+// One-time cost per chunk_miss (~1/frame steady state, ~0.3 ms on a 32 KB
+// chunk at 117 MHz Bphi); amortized over thousands of fetches.
+//
+// On little-endian hosts this is a no-op: native loads already match the
+// GBA storage order.
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+static void byteswap_chunk(uint8_t *buf) {
+    uint32_t *w = (uint32_t *)buf;
+    for (uint32_t i = 0; i < ROM_CHUNK_SIZE / 4; i++) {
+        w[i] = __builtin_bswap32(w[i]);
+    }
+}
+#endif
+
 // Loads a chunk of the ROM into a buffer
 static bool load_chunk(RomBuffer* buffer, int chunk_idx, uint32_t chunk_address) {
     uint32_t file_offset = chunk_address & buffer->rom_mask;
@@ -75,6 +96,11 @@ static bool load_chunk(RomBuffer* buffer, int chunk_idx, uint32_t chunk_address)
         memset((uint8_t *)buffer->chunk_buffers[chunk_idx] + args.result,
                0, ROM_CHUNK_SIZE - args.result);
     }
+
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    // Byteswap whole chunk (zero-fill bytes byteswap to zero, no-op).
+    byteswap_chunk(buffer->chunk_buffers[chunk_idx]);
+#endif
 
     buffer->chunk_addresses[chunk_idx] = chunk_address;
 
@@ -196,13 +222,18 @@ void rom_buffer_cleanup(RomBuffer* buffer) {
     buffer->active_chunks = 0;
 }
 
+// Address munging is defined in rom_buffer.h alongside the byteswap
+// convention so the inline _fast variants and the slow paths agree.
+// On BE hosts: byte offset N is at swapped offset N^3, halfword offset N
+// is at swapped offset N^2. On LE hosts both XOR masks are 0.
+
 uint8_t rom_buffer_read_8(RomBuffer* buffer, uint32_t address) {
     int chunk_idx = get_chunk_for_address(buffer, address);
     if (chunk_idx < 0) {
         return 0xFF;  // Failed to load chunk
     }
-    
-    uint32_t offset = address & (ROM_CHUNK_SIZE - 1);
+
+    uint32_t offset = (address & (ROM_CHUNK_SIZE - 1)) ^ ROM_BYTE_OFF_XOR;
     return buffer->chunk_buffers[chunk_idx][offset];
 }
 
@@ -212,13 +243,15 @@ uint16_t rom_buffer_read_16(RomBuffer* buffer, uint32_t address) {
 
     uint32_t offset = address & (ROM_CHUNK_SIZE - 1);
 
-    // Fast path: both bytes lie within the same chunk.
+    // Fast path: both bytes lie within the same chunk. On aligned reads
+    // (the only kind callers issue) this is the only path.
     if (offset <= ROM_CHUNK_SIZE - 2) {
-        const uint8_t *p = buffer->chunk_buffers[chunk_idx] + offset;
-        return p[0] | (p[1] << 8);
+        const uint8_t *p = buffer->chunk_buffers[chunk_idx] +
+                           (offset ^ ROM_HALF_OFF_XOR);
+        return *(const uint16_t *)p;
     }
 
-    // Straddling: fall back to per-byte fetch.
+    // Straddling: fall back to per-byte fetch (also handles cross-chunk).
     return rom_buffer_read_8(buffer, address) |
            (rom_buffer_read_8(buffer, address + 1) << 8);
 }
@@ -231,10 +264,7 @@ uint32_t rom_buffer_read_32(RomBuffer* buffer, uint32_t address) {
 
     if (offset <= ROM_CHUNK_SIZE - 4) {
         const uint8_t *p = buffer->chunk_buffers[chunk_idx] + offset;
-        return  (uint32_t)p[0]        |
-               ((uint32_t)p[1] <<  8) |
-               ((uint32_t)p[2] << 16) |
-               ((uint32_t)p[3] << 24);
+        return *(const uint32_t *)p;
     }
 
     return  (uint32_t)rom_buffer_read_8(buffer, address)            |
