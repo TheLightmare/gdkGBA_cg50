@@ -3719,6 +3719,102 @@ static void thumb_proc_init() {
     arm_proc_set(thumb_proc, t16_tst_rdn3,   0b01000010000, 0b11111111110, 11);
 }
 
+// =============================================================
+// Phase 4b -- specialised decoded-block handlers.
+//
+// These take a thumb_uop_t pointer with operands already extracted at
+// decode time. They skip the per-execution arm_op global read + bit
+// extraction that the standard handlers (called via thumb_proc[]) do
+// every iteration. The arithmetic itself stays in the existing inline
+// helpers (arm_arith_*, arm_lsl, etc.) so behaviour is identical to
+// the legacy path -- only the operand-decode path changes.
+//
+// Opcodes not specialised below fall through to t16_dec_call_legacy,
+// which sets arm_op from raw_op and dispatches into the existing
+// thumb_proc[] table.
+
+void t16_dec_mov_imm8(const thumb_uop_t *uop) {
+    uint32_t imm = uop->arg_b;
+    arm_r.r[uop->arg_a] = imm;
+    arm_setn(imm);
+    arm_setz(imm);
+}
+
+void t16_dec_cmp_imm8(const thumb_uop_t *uop) {
+    arm_data_t op = {
+        .rd   = uop->arg_a,
+        .lhs  = arm_r.r[uop->arg_a],
+        .rhs  = uop->arg_b,
+        .cout = false,
+        .s    = true,
+    };
+    arm_arith_cmp(op);
+}
+
+void t16_dec_add_imm8(const thumb_uop_t *uop) {
+    arm_data_t op = {
+        .rd   = uop->arg_a,
+        .lhs  = arm_r.r[uop->arg_a],
+        .rhs  = uop->arg_b,
+        .cout = false,
+        .s    = true,
+    };
+    arm_arith_add(op, ARM_ARITH_NO_C);
+}
+
+void t16_dec_sub_imm8(const thumb_uop_t *uop) {
+    arm_data_t op = {
+        .rd   = uop->arg_a,
+        .lhs  = arm_r.r[uop->arg_a],
+        .rhs  = uop->arg_b,
+        .cout = false,
+        .s    = true,
+    };
+    arm_arith_sub(op);
+}
+
+void t16_dec_lsl_imm5(const thumb_uop_t *uop) {
+    arm_data_t op = {
+        .rd   = uop->arg_a,
+        .lhs  = arm_r.r[uop->arg_b],
+        .rhs  = uop->arg_c,
+        .cout = false,
+        .s    = true,
+    };
+    arm_lsl(op);
+}
+
+void t16_dec_lsr_imm5(const thumb_uop_t *uop) {
+    arm_data_t op = {
+        .rd   = uop->arg_a,
+        .lhs  = arm_r.r[uop->arg_b],
+        .rhs  = uop->arg_c,   // already mapped: 0 -> 32 at decode time
+        .cout = false,
+        .s    = true,
+    };
+    arm_lsr(op);
+}
+
+void t16_dec_asr_imm5(const thumb_uop_t *uop) {
+    arm_data_t op = {
+        .rd   = uop->arg_a,
+        .lhs  = arm_r.r[uop->arg_b],
+        .rhs  = uop->arg_c,   // already mapped: 0 -> 32 at decode time
+        .cout = false,
+        .s    = true,
+    };
+    arm_asr(op);
+}
+
+// Fallback for any opcode without a specialised handler. Restores the
+// arm_op global and dispatches into the existing handler table -- same
+// effect as Phase 4a's executor, just routed through the new handler
+// signature.
+void t16_dec_call_legacy(const thumb_uop_t *uop) {
+    arm_op = uop->raw_op;
+    thumb_proc[uop->raw_op >> 5]();
+}
+
 void arm_init() {
     // Initialize memory buffer contents, not the pointers themselves
     // as they are already declared as arrays
@@ -3922,8 +4018,13 @@ void arm_exec(uint32_t target_cycles) {
                         pipe_reload = false;
                         uint16_t i;
                         for (i = 0; i < b->length; i++) {
-                            arm_op = ops[i].raw_op;
-                            ops[i].handler();
+                            // Phase 4b: handlers take a uop pointer. They
+                            // either pull pre-decoded args from it
+                            // (specialised) or set arm_op from raw_op and
+                            // dispatch through thumb_proc[] (legacy
+                            // fallback). The executor no longer touches
+                            // arm_op directly.
+                            ops[i].handler(&ops[i]);
                             if (pipe_reload) break;     // branch exit
                             arm_r.r[15] += 2;
                         }

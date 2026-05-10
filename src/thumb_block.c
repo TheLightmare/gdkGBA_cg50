@@ -16,11 +16,83 @@ thumb_uop_t   *thumb_uop_pool    = NULL;
 uint16_t       thumb_block_current_gen = 1;
 static uint32_t thumb_uop_pool_head = 0;
 
-// thumb_proc[] is defined in arm.c. We dispatch through it for every
-// in-block opcode; the inlined fast paths in t16_step's switch don't
-// help once we're going through a function pointer anyway. A later
-// phase can swap in specialised handlers for hot opcodes.
+// thumb_proc[] is defined in arm.c. The Phase 4b legacy fallback
+// handler dispatches through it for opcodes without a specialised
+// uop-aware handler.
 extern void (*thumb_proc[2048])();
+
+// Phase 4b specialised handlers (defined in arm.c near the legacy
+// handlers so they have access to the static inline helper functions).
+extern void t16_dec_mov_imm8 (const thumb_uop_t *uop);
+extern void t16_dec_cmp_imm8 (const thumb_uop_t *uop);
+extern void t16_dec_add_imm8 (const thumb_uop_t *uop);
+extern void t16_dec_sub_imm8 (const thumb_uop_t *uop);
+extern void t16_dec_lsl_imm5 (const thumb_uop_t *uop);
+extern void t16_dec_lsr_imm5 (const thumb_uop_t *uop);
+extern void t16_dec_asr_imm5 (const thumb_uop_t *uop);
+extern void t16_dec_call_legacy(const thumb_uop_t *uop);
+
+// Pick the right uop handler for `op` and fill in the operand fields it
+// expects. Falls through to t16_dec_call_legacy for opcodes without a
+// specialised handler -- behaviour identical to the legacy interpreter.
+static void decode_thumb_op(uint16_t op, thumb_uop_t *out) {
+    out->raw_op = op;
+    out->arg_a  = 0;
+    out->arg_b  = 0;
+    out->arg_c  = 0;
+
+    uint8_t top5 = op >> 11;
+    uint16_t imm5;
+
+    switch (top5) {
+        case 0b00000:  // LSL Rd, Rm, #imm5  (also covers MOV Rd, Rm
+                       // when imm5==0 -- arm_lsl with shift=0 produces
+                       // the same Rd-write + N/Z-update + C-unchanged
+                       // effect as t16_mov_rd3).
+            out->handler = t16_dec_lsl_imm5;
+            out->arg_a   = op & 0x7;
+            out->arg_b   = (op >> 3) & 0x7;
+            out->arg_c   = (op >> 6) & 0x1f;
+            return;
+        case 0b00001:  // LSR Rd, Rm, #imm5  (imm5==0 means shift by 32)
+            out->handler = t16_dec_lsr_imm5;
+            out->arg_a   = op & 0x7;
+            out->arg_b   = (op >> 3) & 0x7;
+            imm5 = (op >> 6) & 0x1f;
+            out->arg_c   = (imm5 == 0) ? 32 : imm5;
+            return;
+        case 0b00010:  // ASR Rd, Rm, #imm5  (imm5==0 means shift by 32)
+            out->handler = t16_dec_asr_imm5;
+            out->arg_a   = op & 0x7;
+            out->arg_b   = (op >> 3) & 0x7;
+            imm5 = (op >> 6) & 0x1f;
+            out->arg_c   = (imm5 == 0) ? 32 : imm5;
+            return;
+        case 0b00100:  // MOV Rd, #imm8
+            out->handler = t16_dec_mov_imm8;
+            out->arg_a   = (op >> 8) & 0x7;
+            out->arg_b   = op & 0xff;
+            return;
+        case 0b00101:  // CMP Rd, #imm8
+            out->handler = t16_dec_cmp_imm8;
+            out->arg_a   = (op >> 8) & 0x7;
+            out->arg_b   = op & 0xff;
+            return;
+        case 0b00110:  // ADD Rd, #imm8
+            out->handler = t16_dec_add_imm8;
+            out->arg_a   = (op >> 8) & 0x7;
+            out->arg_b   = op & 0xff;
+            return;
+        case 0b00111:  // SUB Rd, #imm8
+            out->handler = t16_dec_sub_imm8;
+            out->arg_a   = (op >> 8) & 0x7;
+            out->arg_b   = op & 0xff;
+            return;
+        default:
+            out->handler = t16_dec_call_legacy;
+            return;
+    }
+}
 
 // Returns true if the opcode could change PC (or otherwise needs a
 // fresh pipeline at exit). Conservative -- false negatives would let
@@ -130,8 +202,7 @@ const thumb_block_t *thumb_block_decode(uint32_t inst_pc) {
         // miss it goes through the Phase-1 hash table.
         uint16_t op = rom_buffer_read_16_fast(&rom_buffer, pc);
 
-        ops[length].handler = thumb_proc[op >> 5];
-        ops[length].raw_op  = op;
+        decode_thumb_op(op, &ops[length]);
         ops[length].cycles  = region_ws;
         ops[length].pad     = 0;
 

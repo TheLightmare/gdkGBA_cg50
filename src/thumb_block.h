@@ -22,12 +22,33 @@
 // boot. If allocation fails, thumb_block_enabled stays false and the
 // interpreter runs unchanged -- no crash, no perf gain.
 
-// Per-instruction record. 8 bytes.
-typedef struct {
-    void (*handler)();   // entry from thumb_proc[op >> 5]
-    uint16_t raw_op;     // restored to global arm_op before calling handler
+// Per-instruction record. 12 bytes.
+//
+// The handler takes a pointer to its own thumb_uop_t. Specialised
+// handlers (for the hottest opcodes) read pre-decoded operand fields
+// (arg_a / arg_b / arg_c) directly, skipping the per-execution
+// arm_op-read + bit-extraction work the legacy interpreter handlers
+// do every time. Non-specialised opcodes use the t16_dec_call_legacy
+// fallback handler, which sets the global arm_op from raw_op and
+// dispatches into the existing thumb_proc[] table.
+struct thumb_uop_s;
+typedef void (*thumb_uop_handler_t)(const struct thumb_uop_s *uop);
+
+typedef struct thumb_uop_s {
+    thumb_uop_handler_t handler;
+    uint16_t raw_op;     // for the legacy fallback path
     uint8_t  cycles;     // pre-computed waitstate-aware cycle cost
     uint8_t  pad;
+    // Specialised-handler operand fields. Layout depends on the
+    // specific handler; common conventions:
+    //   ALU imm8 (mov/cmp/add/sub Rd, #imm8): arg_a=Rd, arg_b=imm8.
+    //   Shift imm5 (lsl/lsr/asr Rd, Rm, #imm5): arg_a=Rd, arg_b=Rm,
+    //     arg_c=imm5 (with the immediate=0 -> 32 mapping baked in for
+    //     LSR/ASR).
+    //   B imm11: arg_c holds the sign-extended (imm11<<1) byte offset.
+    uint8_t  arg_a;
+    uint8_t  arg_b;
+    uint16_t arg_c;
 } thumb_uop_t;
 
 // Cache directory entry. 16 bytes.
