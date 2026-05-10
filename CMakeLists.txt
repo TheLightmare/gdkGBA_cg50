@@ -20,6 +20,7 @@ set(SOURCES
   src/io.c
   src/rom_buffer.c
   src/sound.c
+  src/thumb_block.c
   src/timer.c
   src/video.c
   # ...
@@ -105,6 +106,7 @@ set_source_files_properties(
 set_source_files_properties(
     src/arm_mem.c
     src/rom_buffer.c
+    src/thumb_block.c
     src/video.c
     src/io.c
     src/dma.c

@@ -8,6 +8,7 @@
 #include "arm_shared.h"
 #include "build_flags.h"
 #include "mem_swizzle.h"
+#include "thumb_block.h"
 
 #include "io.h"
 #include "timer.h"
@@ -3901,6 +3902,62 @@ void arm_exec(uint32_t target_cycles) {
     while (arm_cycles < target_cycles) {
         if (arm_in_thumb()) {
             do {
+                // Block-cache fast path. arm_r.r[15] holds the prefetched
+                // PC (instruction PC + 4 in Thumb), so the actual
+                // instruction PC is r[15] - 4. thumb_block_lookup returns
+                // NULL for non-ROM PCs and stale/missing entries; on a
+                // cold ROM PC, decode synchronously.
+                {
+                    uint32_t inst_pc = arm_r.r[15] - 4u;
+                    const thumb_block_t *b = thumb_block_lookup(inst_pc);
+                    if (!b) b = thumb_block_decode(inst_pc);
+                    if (b) {
+                        const thumb_uop_t *ops =
+                            thumb_uop_pool + b->ops_offset;
+                        arm_cycles += b->total_cycles;
+                        // pipe_reload may be true from a prior branch; clear
+                        // here so the per-instruction check below means
+                        // "this instruction branched" rather than "some
+                        // earlier instruction did".
+                        pipe_reload = false;
+                        uint16_t i;
+                        for (i = 0; i < b->length; i++) {
+                            arm_op = ops[i].raw_op;
+                            ops[i].handler();
+                            if (pipe_reload) break;     // branch exit
+                            arm_r.r[15] += 2;
+                        }
+                        if (i == b->length) {
+                            // Sequential exit: pipe is stale (we never
+                            // fetched during the block). arm_load_pipe
+                            // expects R15 at the address to fetch from;
+                            // we're at next_PC + 4, so step back 4.
+                            arm_r.r[15] -= 4u;
+                            arm_load_pipe();
+                        }
+                        // pipe_reload is true at this point either way
+                        // (sequential exit just called arm_load_pipe;
+                        // branch exit had its handler call arm_load_pipe).
+                        // In normal single-step, t16_inc_r15 of the
+                        // branch iteration consumes pipe_reload before
+                        // the next iteration sees it. Mimic that here:
+                        // without the clear, the first single-step after
+                        // a block exit would skip its R15 += 2 step,
+                        // leaving every subsequent single-step running
+                        // with a 2-byte-stale R15. Symptom: cart hangs
+                        // soon after the first non-cached code path.
+                        pipe_reload = false;
+                        if (int_halt) {
+                            arm_cycles = target_cycles;
+                            goto done;
+                        }
+                        continue;
+                    }
+                }
+
+                // Single-step fallback (RAM-resident Thumb, ROM Thumb
+                // when the cache is disabled, or any case the block
+                // path declined).
                 arm_op      = arm_pipe[0];
                 arm_pipe[0] = arm_pipe[1];
 

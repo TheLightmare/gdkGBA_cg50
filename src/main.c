@@ -17,6 +17,7 @@
 #include "build_flags.h"
 #include "mem_swizzle.h"
 #include "rom_buffer.h"
+#include "thumb_block.h"
 #include "extram.h"
 
 #include "io.h"
@@ -103,6 +104,10 @@ int main(void) {
 
     gint_gba_init();
     arm_init();
+
+    // Allocate the Thumb block cache. Failure is not fatal -- the
+    // interpreter runs unchanged when thumb_block_enabled stays false.
+    thumb_block_init();
 
 
     //TODO : make an actual ROM select menu
@@ -670,7 +675,8 @@ int main(void) {
 
     // Clean up ROM buffer resources
     rom_buffer_cleanup(&rom_buffer);
-    
+    thumb_block_uninit();
+
     gint_gba_uninit();
     arm_uninit();
 

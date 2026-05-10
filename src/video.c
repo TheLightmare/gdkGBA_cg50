@@ -49,6 +49,170 @@ static const uint8_t y_tiles_lut[16] = { 1, 2, 4, 8, 1, 1, 2, 4, 2, 4, 4, 8, 0, 
 static uint8_t layer_mask[240];
 static bool    windows_active;
 
+// Per-pixel layer-ID record for the current scanline. Tracks which layer
+// drew the topmost pixel so blending can decide whether the layer
+// underneath is a "second target" for BLDCNT mode 1, and so OBJ
+// semi-transparent (obj_mode=1) sprites can blend with whatever's
+// underneath regardless of BLDCNT.
+//
+// Values: 0..3 = BG0..BG3, 4 = OBJ, 5 = backdrop.
+//
+// Updated unconditionally on every pixel write (one byte per pixel) so
+// the blend code at the next layer can read it back. The cost is small
+// vs. the existing per-pixel work.
+#define LAYER_BG0  0
+#define LAYER_BG1  1
+#define LAYER_BG2  2
+#define LAYER_BG3  3
+#define LAYER_OBJ  4
+#define LAYER_BD   5
+#define LAYER_BIT(L)  (1u << (L))
+static uint8_t layer_id_buf[240];
+
+// Blend state, refreshed at the start of each scanline from BLDCNT /
+// BLDALPHA / BLDY. Cached in scanline-local statics so the per-pixel
+// blend path doesn't re-read the IO regs and re-mask each time.
+//
+//   blend_mode  -- BLDCNT bits 6-7: 0 none, 1 alpha, 2 brightness inc,
+//                  3 brightness dec
+//   blend_first -- BLDCNT bits 0-5: 1st-target layer mask
+//                  (bit 0=BG0..bit4=OBJ, bit5=backdrop)
+//   blend_second-- BLDCNT bits 8-13: 2nd-target layer mask
+//   blend_eva   -- BLDALPHA bits 0-4 clamped to [0,16]
+//   blend_evb   -- BLDALPHA bits 8-12 clamped to [0,16]
+//   blend_evy   -- BLDY bits 0-4 clamped to [0,16]
+//   blend_any   -- true if BLDCNT mode != 0 OR any sprite this line could
+//                  be semi-trans. We don't pre-scan OAM for the latter,
+//                  so just set it true whenever OBJ is enabled in
+//                  DISPCNT -- the per-pixel OBJ writer will short-
+//                  circuit on obj_mode != 1 anyway.
+static uint8_t blend_mode;
+static uint8_t blend_first;
+static uint8_t blend_second;
+static uint8_t blend_eva;
+static uint8_t blend_evb;
+static uint8_t blend_evy;
+static bool    blend_any;
+
+static void compute_blend_state(void) {
+    blend_mode   = (bld_cnt.w >> 6) & 3;
+    blend_first  = bld_cnt.b.b0 & 0x3f;
+    blend_second = bld_cnt.b.b1 & 0x3f;
+    uint8_t eva = bld_alpha.b.b0 & 0x1f;
+    blend_eva = (eva > 16) ? 16 : eva;
+    uint8_t evb = bld_alpha.b.b1 & 0x1f;
+    blend_evb = (evb > 16) ? 16 : evb;
+    uint8_t evy = bld_bright.b.b0 & 0x1f;
+    blend_evy = (evy > 16) ? 16 : evy;
+
+    // Skip the per-pixel layer-ID buffer maintenance entirely when
+    // nothing this scanline could need it. OBJ semi-trans is always
+    // possible if OBJ is enabled, so include that case.
+    blend_any = (blend_mode != 0) || (disp_cnt.w & OBJ_ENB);
+}
+
+// RGB565 alpha blend: result = clamp((src * eva + dst * evb) / 16) per
+// channel. eva and evb are 0..16.
+static inline uint16_t blend_alpha_rgb565(uint16_t src, uint16_t dst,
+                                          uint8_t eva, uint8_t evb) {
+    uint32_t sr = (src >> 11) & 0x1f;
+    uint32_t sg = (src >>  5) & 0x3f;
+    uint32_t sb =  src        & 0x1f;
+    uint32_t dr = (dst >> 11) & 0x1f;
+    uint32_t dg = (dst >>  5) & 0x3f;
+    uint32_t db =  dst        & 0x1f;
+    uint32_t r = (sr * eva + dr * evb) >> 4;
+    uint32_t g = (sg * eva + dg * evb) >> 4;
+    uint32_t b = (sb * eva + db * evb) >> 4;
+    if (r > 31) r = 31;
+    if (g > 63) g = 63;
+    if (b > 31) b = 31;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+// Apply blend mode to a freshly-drawn `src` pixel from layer `src_layer`,
+// given the existing pixel `dst` from layer `dst_layer`. Returns the
+// pixel to actually write. When blending doesn't apply, returns `src`
+// unchanged.
+//
+// Special-case OBJ semi-transparent: an OBJ pixel with attr0 mode == 1
+// alpha-blends with the underlying pixel regardless of BLDCNT mode, as
+// long as the underlying is in the second-target mask. The caller
+// passes obj_semitrans=true for that case.
+static inline uint16_t blend_apply(uint16_t src, uint8_t src_layer,
+                                   uint16_t dst, uint8_t dst_layer,
+                                   bool obj_semitrans) {
+    if (obj_semitrans) {
+        // OBJ semi-trans is alpha blend with EVA/EVB, gated only by the
+        // 2nd-target check; effectively overrides the BLDCNT mode.
+        if (blend_second & LAYER_BIT(dst_layer)) {
+            return blend_alpha_rgb565(src, dst, blend_eva, blend_evb);
+        }
+        return src;
+    }
+
+    if (blend_mode == 0) return src;
+    if (!(blend_first & LAYER_BIT(src_layer))) return src;
+
+    if (blend_mode == 1) {
+        // Alpha: only when the layer underneath is a 2nd target.
+        if (!(blend_second & LAYER_BIT(dst_layer))) return src;
+        return blend_alpha_rgb565(src, dst, blend_eva, blend_evb);
+    }
+    // Brightness modes don't read `dst`.
+    uint32_t r = (src >> 11) & 0x1f;
+    uint32_t g = (src >>  5) & 0x3f;
+    uint32_t b =  src        & 0x1f;
+    if (blend_mode == 2) {
+        // inc: c += (max - c) * EVY / 16
+        r += ((31 - r) * blend_evy) >> 4;
+        g += ((63 - g) * blend_evy) >> 4;
+        b += ((31 - b) * blend_evy) >> 4;
+    } else {
+        // mode == 3, dec: c -= c * EVY / 16
+        r -= (r * blend_evy) >> 4;
+        g -= (g * blend_evy) >> 4;
+        b -= (b * blend_evy) >> 4;
+    }
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+// Per-pixel write helpers used by the BG and OBJ rasterisers. They keep
+// layer_id_buf consistent and apply BLDCNT when applicable. The
+// blend_any short-circuit means the only added cost on a no-blend
+// scanline is one byte store per pixel.
+static inline void write_bg_pixel(uint8_t *screen_b, uint32_t addr,
+                                  uint16_t color, uint8_t pixel_x,
+                                  uint8_t bg_layer) {
+    uint16_t *p = (uint16_t *)(screen_b + addr);
+    if (blend_any) {
+        if (blend_mode != 0 && (blend_first & LAYER_BIT(bg_layer))) {
+            uint16_t dst = *p;
+            uint8_t  dst_layer = layer_id_buf[pixel_x];
+            color = blend_apply(color, bg_layer, dst, dst_layer, false);
+        }
+        layer_id_buf[pixel_x] = bg_layer;
+    }
+    *p = color;
+}
+
+static inline void write_obj_pixel(uint8_t *screen_b, uint32_t addr,
+                                   uint16_t color, uint8_t pixel_x,
+                                   uint8_t obj_mode) {
+    uint16_t *p = (uint16_t *)(screen_b + addr);
+    bool semitrans = (obj_mode == 1);
+    if (blend_any) {
+        if (semitrans ||
+            (blend_mode != 0 && (blend_first & LAYER_BIT(LAYER_OBJ)))) {
+            uint16_t dst = *p;
+            uint8_t  dst_layer = layer_id_buf[pixel_x];
+            color = blend_apply(color, LAYER_OBJ, dst, dst_layer, semitrans);
+        }
+        layer_id_buf[pixel_x] = LAYER_OBJ;
+    }
+    *p = color;
+}
+
 static void compute_layer_mask(void) {
     bool win0_on   = (disp_cnt.w >> 13) & 1;
     bool win1_on   = (disp_cnt.w >> 14) & 1;
@@ -226,8 +390,10 @@ static void render_obj(uint8_t prio) {
                         if (pal_idx
                             && (!windows_active || (layer_mask[sx] & 0x10))) {
                             uint32_t pal_addr = 0x100 | pal_idx | pal_base;
-                            *(uint16_t *)((uint8_t *)screen + address + i * 2)
-                                = palette[pal_addr];
+                            write_obj_pixel((uint8_t *)screen,
+                                            address + i * 2,
+                                            palette[pal_addr],
+                                            (uint8_t)sx, obj_mode);
                         }
                     }
 
@@ -276,7 +442,9 @@ static void render_obj(uint8_t prio) {
 
                     if (pal_idx
                         && (!windows_active || (layer_mask[obj_x + x] & 0x10)))
-                        *(uint16_t *)((uint8_t *)screen + address) = palette[pal_addr];
+                        write_obj_pixel((uint8_t *)screen, address,
+                                        palette[pal_addr],
+                                        (uint8_t)(obj_x + x), obj_mode);
                 }
             }
         }
@@ -358,7 +526,9 @@ static void render_bg() {
                             if (pal_idx
                                 && (!windows_active
                                     || (layer_mask[x] & (1 << bg_idx))))
-                                *(uint16_t *)((uint8_t *)screen + address) = palette[pal_idx];
+                                write_bg_pixel((uint8_t *)screen, address,
+                                               palette[pal_idx], x,
+                                               (uint8_t)bg_idx);
                         }
                     } else {
                         // Tile-coherent non-affine render. Consecutive pixels
@@ -428,8 +598,10 @@ static void render_bg() {
                                 if (pal_idx
                                     && (!windows_active
                                         || (layer_mask[x + i] & bg_bit))) {
-                                    *(uint16_t *)((uint8_t *)screen + address)
-                                        = palette[pal_idx | pal_base];
+                                    write_bg_pixel((uint8_t *)screen, address,
+                                                   palette[pal_idx | pal_base],
+                                                   (uint8_t)(x + i),
+                                                   (uint8_t)bg_idx);
                                 }
                                 address += 2;
                             }
@@ -456,8 +628,8 @@ static void render_bg() {
                 uint16_t g = (pixel >>  5) & 0x1f;
                 uint16_t b = (pixel >> 10) & 0x1f;
 
-                *(uint16_t *)((uint8_t *)screen + surf_addr) =
-                    (r << 11) | (((g << 1) | (g >> 4)) << 5) | b;
+                uint16_t color = (r << 11) | (((g << 1) | (g >> 4)) << 5) | b;
+                write_bg_pixel((uint8_t *)screen, surf_addr, color, x, LAYER_BG2);
 
                 surf_addr += 2;
 
@@ -473,7 +645,8 @@ static void render_bg() {
             for (x = 0; x < 240; x++) {
                 uint8_t pal_idx = vram[frm_addr++];
 
-                *(uint16_t *)((uint8_t *)screen + surf_addr) = palette[pal_idx];
+                write_bg_pixel((uint8_t *)screen, surf_addr,
+                               palette[pal_idx], x, LAYER_BG2);
 
                 surf_addr += 2;
             }
@@ -493,8 +666,25 @@ static void render_line() {
         return;
     }
 
+    compute_blend_state();
+
     uint16_t backdrop = palette[0];
-    for (int i = 0; i < 240; i++) line[i] = backdrop;
+    // If backdrop is a brightness 1st-target, the displayed colour is
+    // the brightened/darkened backdrop; alpha mode never applies to
+    // backdrop alone (no second-target underneath). Pre-compute once
+    // and broadcast across the line.
+    if (blend_any && blend_mode >= 2 &&
+        (blend_first & LAYER_BIT(LAYER_BD))) {
+        backdrop = blend_apply(backdrop, LAYER_BD, backdrop, LAYER_BD, false);
+    }
+    if (blend_any) {
+        for (int i = 0; i < 240; i++) {
+            line[i] = backdrop;
+            layer_id_buf[i] = LAYER_BD;
+        }
+    } else {
+        for (int i = 0; i < 240; i++) line[i] = backdrop;
+    }
 
     compute_layer_mask();
 
