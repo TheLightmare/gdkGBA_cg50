@@ -6,6 +6,7 @@
 #include "bench.h"
 #include "build_flags.h"
 #include "io.h"
+#include "mem_swizzle.h"
 #include "rom_buffer.h"
 #include "extram.h"
 
@@ -73,21 +74,30 @@ static mem_page_t mem_write_pages[256] GXRAM;
 
 // Populate mem_read_pages and mem_write_pages.
 //
-// READ entries: regions whose reads are a flat masked load from a host
-// buffer (EWRAM, IWRAM, PRAM, OAM). VRAM (0x06) is handled by an inline
-// branch in the read fast path because its mirroring rule needs more
-// than a single AND mask. ROM is left NULL because it goes through
-// rom_buffer's chunk cache. BIOS/IO/EEPROM/Flash stay NULL.
+// EWRAM (0x02) and IWRAM (0x03) are deliberately NOT entered into the
+// page table. Their backing buffers are stored in host-native byte order
+// (see mem_swizzle.h) so the read/write fast paths can issue a single
+// SH4 bus transaction instead of byte-by-byte assembly. The fast paths
+// branch on (region == 0x02 / 0x03) explicitly before consulting the
+// table.
 //
-// WRITE entries: regions whose writes are a flat masked store. EWRAM,
-// IWRAM, OAM. PRAM is excluded because writes there must update the
-// RGB565 cache. VRAM is excluded because of the mirroring rule and
-// because byte-writes to BG-VRAM duplicate to halfword. Note OAM byte
-// writes are silently dropped on real hardware; arm_writeb checks for
-// OAM (region 7) before consulting the page table.
+// READ entries left in the table: PRAM (0x05) and OAM (0x07) -- both
+// stored in raw guest byte order because their consumers (palette[]
+// cache and the renderer's direct oam[] reads) expect that layout. VRAM
+// (0x06) has a mirroring rule too complex for a single AND mask and is
+// handled inline.
+//
+// WRITE entries left: only OAM (0x07). PRAM has a side effect (BGR555 ->
+// RGB565 cache update) that needs the inlined fast path in arm_writeh /
+// arm_write. VRAM is excluded because of the mirroring rule and the
+// byte-write-duplicates-to-halfword quirk. Note OAM byte writes are
+// silently dropped on real hardware; arm_writeb checks for OAM
+// (region 7) before consulting the page table.
 //
 // Called from ewram_init() because wram_board / ewram_mask are only
-// finalized there.
+// finalised there. The wram_board / ewram_mask init path no longer
+// touches the page table for region 0x02 since that's handled by the
+// explicit fast path in arm_readb / arm_readh / arm_read instead.
 static void arm_mem_pages_init(void) {
     for (int i = 0; i < 256; i++) {
         mem_read_pages[i].base = NULL;
@@ -95,19 +105,11 @@ static void arm_mem_pages_init(void) {
         mem_write_pages[i].base = NULL;
         mem_write_pages[i].mask = 0;
     }
-    mem_read_pages[0x02].base = wram_board;
-    mem_read_pages[0x02].mask = ewram_mask;
-    mem_read_pages[0x03].base = wram_chip;
-    mem_read_pages[0x03].mask = 0x7FFF;
     mem_read_pages[0x05].base = palette_ram;
     mem_read_pages[0x05].mask = 0x3FF;
     mem_read_pages[0x07].base = oam;
     mem_read_pages[0x07].mask = 0x3FF;
 
-    mem_write_pages[0x02].base = wram_board;
-    mem_write_pages[0x02].mask = ewram_mask;
-    mem_write_pages[0x03].base = wram_chip;
-    mem_write_pages[0x03].mask = 0x7FFF;
     mem_write_pages[0x07].base = oam;
     mem_write_pages[0x07].mask = 0x3FF;
 }
@@ -206,11 +208,11 @@ static uint8_t bios_read(uint32_t address) {
 // mirroring of the upper region).
 
 static uint8_t wram_read(uint32_t address) {
-    return wram_board[address & ewram_mask];
+    return mem_swz_read_b(wram_board, address & ewram_mask);
 }
 
 static uint8_t iwram_read(uint32_t address) {
-    return wram_chip[address & 0x7fff];
+    return mem_swz_read_b(wram_chip, address & 0x7fff);
 }
 
 static uint8_t pram_read(uint32_t address) {
@@ -385,24 +387,33 @@ uint32_t arm_read_slow(uint32_t address) {
     return ROR(value, s << 3);
 }
 
-// Fast paths: page-table lookup for EWRAM/IWRAM/PRAM/OAM, plus an inlined
-// VRAM branch. The fast path has none of the open-bus / BIOS-leak
-// post-processing because those regions are guaranteed-real-memory:
-// IS_OPEN_BUS is false (region is in 2/3/5/6/7), the address has no
-// 0x08000000 bit, and we're not in BIOS. The only side effect we need to
-// preserve is `io_open_bus = 0` (the existing slow path's
-// `&= ((addr >> 24) == 4)` evaluates to 0 here).
+// Fast paths: explicit EWRAM/IWRAM branches using native loads on the
+// host-swizzled buffers (one SH4 bus transaction per aligned access),
+// then a page-table lookup for PRAM/OAM, plus an inlined VRAM branch.
+// All fast paths have none of the open-bus / BIOS-leak post-processing
+// because those regions are guaranteed-real-memory: IS_OPEN_BUS is
+// false, the address has no 0x08000000 bit, and we're not in BIOS. The
+// only side effect we need to preserve is `io_open_bus = 0`.
 //
-// VRAM (0x06) is inlined rather than tabled because its mirroring rule
-// (96 KB visible window, with the 32 KB high half mirrored at 0x18000)
-// can't be expressed as a single AND mask.
+// VRAM (0x06) stays inlined rather than tabled because its mirroring
+// rule (96 KB visible window, with the 32 KB high half mirrored at
+// 0x18000) can't be expressed as a single AND mask.
 uint8_t arm_readb(uint32_t address) {
-    mem_page_t *p = &mem_read_pages[(address >> 24) & 0xFF];
+    uint32_t reg = (address >> 24) & 0xFF;
+    if (reg == 0x03) {
+        io_open_bus = false;
+        return mem_swz_read_b(wram_chip, address & 0x7FFF);
+    }
+    if (reg == 0x02) {
+        io_open_bus = false;
+        return mem_swz_read_b(wram_board, address & ewram_mask);
+    }
+    mem_page_t *p = &mem_read_pages[reg];
     if (p->base) {
         io_open_bus = false;
         return p->base[address & p->mask];
     }
-    if ((address >> 24) == 0x06) {
+    if (reg == 0x06) {
         uint32_t off = address & 0x1FFFF;
         if (off & 0x10000) off &= 0x17FFF;
         io_open_bus = false;
@@ -413,7 +424,18 @@ uint8_t arm_readb(uint32_t address) {
 
 uint32_t arm_readh(uint32_t address) {
     uint32_t a = address & ~1;
-    mem_page_t *p = &mem_read_pages[(a >> 24) & 0xFF];
+    uint32_t reg = (a >> 24) & 0xFF;
+    if (reg == 0x03) {
+        io_open_bus = false;
+        uint32_t value = mem_swz_read_h(wram_chip, a & 0x7FFF);
+        return ROR(value, (address & 1) << 3);
+    }
+    if (reg == 0x02) {
+        io_open_bus = false;
+        uint32_t value = mem_swz_read_h(wram_board, a & ewram_mask);
+        return ROR(value, (address & 1) << 3);
+    }
+    mem_page_t *p = &mem_read_pages[reg];
     if (p->base) {
         io_open_bus = false;
         const uint8_t *src = p->base + (a & p->mask);
@@ -421,7 +443,7 @@ uint32_t arm_readh(uint32_t address) {
                        | ((uint32_t)src[1] << 8);
         return ROR(value, (address & 1) << 3);
     }
-    if ((a >> 24) == 0x06) {
+    if (reg == 0x06) {
         uint32_t off = a & 0x1FFFF;
         if (off & 0x10000) off &= 0x17FFF;
         io_open_bus = false;
@@ -435,7 +457,18 @@ uint32_t arm_readh(uint32_t address) {
 
 uint32_t arm_read(uint32_t address) {
     uint32_t a = address & ~3;
-    mem_page_t *p = &mem_read_pages[(a >> 24) & 0xFF];
+    uint32_t reg = (a >> 24) & 0xFF;
+    if (reg == 0x03) {
+        io_open_bus = false;
+        uint32_t value = mem_swz_read_w(wram_chip, a & 0x7FFF);
+        return ROR(value, (address & 3) << 3);
+    }
+    if (reg == 0x02) {
+        io_open_bus = false;
+        uint32_t value = mem_swz_read_w(wram_board, a & ewram_mask);
+        return ROR(value, (address & 3) << 3);
+    }
+    mem_page_t *p = &mem_read_pages[reg];
     if (p->base) {
         io_open_bus = false;
         const uint8_t *src = p->base + (a & p->mask);
@@ -445,7 +478,7 @@ uint32_t arm_read(uint32_t address) {
                        | ((uint32_t)src[3] << 24);
         return ROR(value, (address & 3) << 3);
     }
-    if ((a >> 24) == 0x06) {
+    if (reg == 0x06) {
         uint32_t off = a & 0x1FFFF;
         if (off & 0x10000) off &= 0x17FFF;
         io_open_bus = false;
@@ -497,11 +530,11 @@ uint32_t arm_read_s(uint32_t address) {
 
 //Memory write
 static void wram_write(uint32_t address, uint8_t value) {
-    wram_board[address & ewram_mask] = value;
+    mem_swz_write_b(wram_board, address & ewram_mask, value);
 }
 
 static void iwram_write(uint32_t address, uint8_t value) {
-    wram_chip[address & 0x7fff] = value;
+    mem_swz_write_b(wram_chip, address & 0x7fff, value);
 }
 
 static void pram_write(uint32_t address, uint8_t value) {
@@ -670,8 +703,17 @@ void arm_writeb(uint32_t address, uint8_t value) {
     // OAM (region 7) silently drops 8-bit writes on real hardware.
     if (ah == 7) return;
 
-    // Fast path: EWRAM/IWRAM byte writes are a flat masked store with no
-    // side effects.
+    // Fast path: EWRAM/IWRAM byte writes go to the host-swizzled buffers.
+    if (ah == 0x03) {
+        mem_swz_write_b(wram_chip, address & 0x7FFF, value);
+        return;
+    }
+    if (ah == 0x02) {
+        mem_swz_write_b(wram_board, address & ewram_mask, value);
+        return;
+    }
+    // Other page-table regions (only OAM remains writable through here,
+    // and that's already handled above).
     mem_page_t *p = &mem_write_pages[ah];
     if (p->base) {
         p->base[address & p->mask] = value;
@@ -702,10 +744,20 @@ void arm_writeb(uint32_t address, uint8_t value) {
 
 void arm_writeh(uint32_t address, uint16_t value) {
     uint32_t a = address & ~1;
+    uint32_t ah = (a >> 24) & 0xFF;
 
-    // Fast path: EWRAM/IWRAM/OAM halfword writes are two contiguous byte
-    // stores into a host buffer.
-    mem_page_t *p = &mem_write_pages[(a >> 24) & 0xFF];
+    // Fast path: EWRAM/IWRAM halfword writes go to the host-swizzled
+    // buffers as a single 16-bit store.
+    if (ah == 0x03) {
+        mem_swz_write_h(wram_chip, a & 0x7FFF, value);
+        return;
+    }
+    if (ah == 0x02) {
+        mem_swz_write_h(wram_board, a & ewram_mask, value);
+        return;
+    }
+    // Other page-table regions (OAM keeps the byte-store path).
+    mem_page_t *p = &mem_write_pages[ah];
     if (p->base) {
         uint8_t *dst = p->base + (a & p->mask);
         dst[0] = (uint8_t)(value >> 0);
@@ -744,10 +796,20 @@ void arm_writeh(uint32_t address, uint16_t value) {
 
 void arm_write(uint32_t address, uint32_t value) {
     uint32_t a = address & ~3;
+    uint32_t ah = (a >> 24) & 0xFF;
 
-    // Fast path: EWRAM/IWRAM/OAM word writes are four contiguous byte
-    // stores into a host buffer.
-    mem_page_t *p = &mem_write_pages[(a >> 24) & 0xFF];
+    // Fast path: EWRAM/IWRAM word writes go to the host-swizzled buffers
+    // as a single 32-bit store.
+    if (ah == 0x03) {
+        mem_swz_write_w(wram_chip, a & 0x7FFF, value);
+        return;
+    }
+    if (ah == 0x02) {
+        mem_swz_write_w(wram_board, a & ewram_mask, value);
+        return;
+    }
+    // Other page-table regions (OAM keeps the byte-store path).
+    mem_page_t *p = &mem_write_pages[ah];
     if (p->base) {
         uint8_t *dst = p->base + (a & p->mask);
         dst[0] = (uint8_t)(value >>  0);

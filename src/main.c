@@ -15,6 +15,7 @@
 #include "arm_mem.h"
 #include "bench.h"
 #include "build_flags.h"
+#include "mem_swizzle.h"
 #include "rom_buffer.h"
 #include "extram.h"
 
@@ -516,8 +517,8 @@ int main(void) {
                 uint8_t b;
                 uint32_t a = base + j;
                 if (a < 0x4000)             b = bios[a];
-                else if ((a >> 24) == 2)    b = wram_board[a & ewram_mask];
-                else if ((a >> 24) == 3)    b = wram_chip[a & 0x7FFF];
+                else if ((a >> 24) == 2)    b = mem_swz_read_b(wram_board, a & ewram_mask);
+                else if ((a >> 24) == 3)    b = mem_swz_read_b(wram_chip,  a & 0x7FFF);
                 else if ((a >> 24) >= 8 && (a >> 24) <= 0xB)
                                             b = arm_readb(a);
                 else                        b = 0;
@@ -542,11 +543,7 @@ int main(void) {
             // Read what BIOS will fetch as the user IRQ handler address.
             // The BIOS at 0x134 does LDR pc,[0x03FFFFFC], and that mirrors
             // wram_chip[0x7FFC..0x7FFF] (IWRAM, 32 KB masked).
-            uint32_t user_irq_handler =
-                ((uint32_t)wram_chip[0x7FFC]) |
-                ((uint32_t)wram_chip[0x7FFD] << 8) |
-                ((uint32_t)wram_chip[0x7FFE] << 16) |
-                ((uint32_t)wram_chip[0x7FFF] << 24);
+            uint32_t user_irq_handler = mem_swz_read_w(wram_chip, 0x7FFC);
             n += snprintf(buf + n, sizeof(buf) - n,
                 "*(0x03007FFC) = %08lX  (cart user IRQ handler)\n",
                 (unsigned long)user_irq_handler);

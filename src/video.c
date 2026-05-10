@@ -548,6 +548,28 @@ void run_frame() {
     static uint32_t skip_phase = 0;
     bool render_this_frame = (skip_phase++ % (FRAMESKIP + 1)) == 0;
 
+    // Decide once per frame whether the per-scanline CPU schedule needs
+    // the mid-line exit. The split exists so HBlank IRQ and HBlank-timed
+    // DMA fire between the visible-portion arm_exec and the HBlank-
+    // portion arm_exec. If neither is active, the second slice is pure
+    // overhead -- cut it out and run a single arm_exec(CYC_LINE_TOTAL)
+    // per line, halving the per-frame CPU-slice count from ~456 to ~228.
+    //
+    // Detection is pinned at frame start. A cart that enables HBlank
+    // IRQ mid-frame would have IRQs skipped until next frame; carts
+    // almost always configure HBlank IRQ during VBlank or boot, so this
+    // is a tolerable edge case.
+    bool hblank_irq_on = (disp_stat.w & HBLK_IRQ) != 0;
+    bool hblank_dma_on = false;
+    for (int ch = 0; ch < 4; ch++) {
+        if ((dma_ch[ch].ctrl.w & DMA_ENB) &&
+            ((dma_ch[ch].ctrl.w >> 12) & 3) == HBLANK) {
+            hblank_dma_on = true;
+            break;
+        }
+    }
+    bool need_hblank_split = hblank_irq_on || hblank_dma_on;
+
     disp_stat.w &= ~VBLK_FLAG;
 
     screen = gint_vram;
@@ -569,19 +591,43 @@ void run_frame() {
             dma_transfer_gba(VBLANK);
         }
 
-        BENCH_TIME_BLOCK(bench_arm_exec_ticks, arm_exec(CYC_LINE_HBLK0));
+        if (need_hblank_split) {
+            // Split path: HBlank effects are active this frame. Run CPU
+            // up to the HBlank boundary, render, fire HBlank DMA + IRQ,
+            // then run CPU through HBlank.
+            BENCH_TIME_BLOCK(bench_arm_exec_ticks, arm_exec(CYC_LINE_HBLK0));
 
-        //H-Blank start
-        if (v_count.w < LINES_VISIBLE) {
-            if (render_this_frame) {
+            if (v_count.w < LINES_VISIBLE) {
+                if (render_this_frame) {
+                    BENCH_TIME_BLOCK(bench_render_ticks, render_line());
+                }
+                dma_transfer_gba(HBLANK);
+            }
+
+            hblank_start();
+
+            BENCH_TIME_BLOCK(bench_arm_exec_ticks, arm_exec(CYC_LINE_HBLK1));
+        } else {
+            // Merged path: no HBlank IRQ, no HBlank-timed DMA. Render
+            // with start-of-line register state (closer to real-hardware
+            // tile-mode "snapshot per scanline" than the original's
+            // mid-line snapshot, and the cart can't react in real time
+            // anyway with no IRQ to wake on). Then run a single full-
+            // line arm_exec.
+            //
+            // hblank_start() still fires so polling carts see HBLK_FLAG
+            // transition; no IRQ is triggered because HBLK_IRQ is off
+            // in this branch.
+            if (v_count.w < LINES_VISIBLE && render_this_frame) {
                 BENCH_TIME_BLOCK(bench_render_ticks, render_line());
             }
-            dma_transfer_gba(HBLANK);
+            // dma_transfer_gba(HBLANK) skipped: no HBlank-timed
+            // channels are enabled in this branch.
+
+            hblank_start();
+
+            BENCH_TIME_BLOCK(bench_arm_exec_ticks, arm_exec(CYC_LINE_TOTAL));
         }
-
-        hblank_start();
-
-        BENCH_TIME_BLOCK(bench_arm_exec_ticks, arm_exec(CYC_LINE_HBLK1));
 
         // Sound is not piped to any output yet, and sound_clock() does
         // double-precision FP math per scanline that is very slow on the

@@ -7,6 +7,7 @@
 #include "arm_mem.h"
 #include "arm_shared.h"
 #include "build_flags.h"
+#include "mem_swizzle.h"
 
 #include "io.h"
 #include "timer.h"
@@ -319,8 +320,8 @@ static inline uint32_t le32_at(const uint8_t *p) {
 static uint16_t arm_fetchh(access_type_e at) {
     switch (arm_r.r[15] >> 24) {
         case 0x0: arm_cycles += 1; bios_op = le32_at(bios + (arm_r.r[15] & 0x3ffc)); return le16_at(bios + (arm_r.r[15] & 0x3fff));
-        case 0x2: arm_cycles += 3; return le16_at(wram_board + (arm_r.r[15] & ewram_mask));
-        case 0x3: arm_cycles += 1; return le16_at(wram_chip + (arm_r.r[15] & 0x7fff));
+        case 0x2: arm_cycles += 3; return mem_swz_read_h(wram_board, arm_r.r[15] & ewram_mask);
+        case 0x3: arm_cycles += 1; return mem_swz_read_h(wram_chip,  arm_r.r[15] & 0x7fff);
         case 0x5: arm_cycles += 1; return le16_at(palette_ram + (arm_r.r[15] & 0x3ff));
         case 0x7: arm_cycles += 1; return le16_at(oam + (arm_r.r[15] & 0x3ff));
 
@@ -362,8 +363,8 @@ static uint16_t arm_fetchh(access_type_e at) {
 static uint32_t arm_fetch(access_type_e at) {
     switch (arm_r.r[15] >> 24) {
         case 0x0: arm_cycles += 1; return (bios_op = le32_at(bios + (arm_r.r[15] & 0x3ffc)));
-        case 0x2: arm_cycles += 6; return le32_at(wram_board + (arm_r.r[15] & (ewram_mask & ~3u)));
-        case 0x3: arm_cycles += 1; return le32_at(wram_chip + (arm_r.r[15] & 0x7ffc));
+        case 0x2: arm_cycles += 6; return mem_swz_read_w(wram_board, arm_r.r[15] & ewram_mask);
+        case 0x3: arm_cycles += 1; return mem_swz_read_w(wram_chip,  arm_r.r[15] & 0x7fff);
         case 0x5: arm_cycles += 1; return le32_at(palette_ram + (arm_r.r[15] & 0x3fc));
         case 0x7: arm_cycles += 1; return le32_at(oam + (arm_r.r[15] & 0x3fc));
 
@@ -3177,7 +3178,7 @@ static void hle_vblank_intr_wait(void) {
     // it like real BIOS does (would need recursive arm_exec), but
     // clearing it on entry mirrors the discardOldFlags=true behaviour
     // that almost all callers want.
-    wram_chip[0x7FF8] &= ~0x01;
+    MEM_SWZ_BYTE_LV(wram_chip, 0x7FF8) &= ~0x01;
 
     int_halt = true;
 }
@@ -3189,8 +3190,8 @@ static void hle_intr_wait(void) {
     if (arm_r.r[0]) {
         // discardOldFlags: clear matching BIOSIF bits.
         uint16_t mask = (uint16_t)arm_r.r[1];
-        wram_chip[0x7FF8] &= ~(uint8_t)(mask & 0xFF);
-        wram_chip[0x7FF9] &= ~(uint8_t)(mask >> 8);
+        MEM_SWZ_BYTE_LV(wram_chip, 0x7FF8) &= ~(uint8_t)(mask & 0xFF);
+        MEM_SWZ_BYTE_LV(wram_chip, 0x7FF9) &= ~(uint8_t)(mask >> 8);
     }
 
     int_halt = true;
