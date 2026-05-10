@@ -258,196 +258,326 @@ static void compute_layer_mask(void) {
     }
 }
 
-static void render_obj(uint8_t prio) {
+// Per-line sprite list precomputation
+//
+// render_obj used to walk all 128 OAM entries every time it was called
+// (once per priority, four times per scanline = 81,920 entry checks per
+// frame). Most of that work was repeated decoding -- read attr0/1/2,
+// extract ~10 bit-fields, compute extents, do the visibility check --
+// just to bail on entries that didn't apply to this priority or this
+// scanline.
+//
+// The lists below are populated once per rendered frame from
+// build_sprite_lists(). They map (scanline, priority) to the list of
+// OAM indices visible there. render_obj just walks the matching list.
+//
+// Stacking order: GBA convention is "lower OAM index = drawn last (on
+// top) within a priority". We walk OAM 0..127 forward when building so
+// that on overflow the BACK sprites (high OAM) are dropped first --
+// front sprites stay visible. The renderer iterates the list in reverse
+// to get back-to-front compositing.
+//
+// Cap is 32 sprites per (line, priority). Real GBA has a per-scanline
+// cycle budget for OBJ rendering rather than a count cap; 32 covers the
+// vast majority of game scenes. Mid-frame OAM writes (rare; almost
+// always done during VBlank or via VBlank-DMA) won't be reflected
+// until the next frame.
+
+#define OBJ_LINE_CAP  32
+
+#define DECOBJ_FLAG_AFFINE  (1u << 0)
+#define DECOBJ_FLAG_FLIPX   (1u << 1)
+#define DECOBJ_FLAG_FLIPY   (1u << 2)
+#define DECOBJ_FLAG_IS256   (1u << 3)
+#define DECOBJ_FLAG_DROP    (1u << 4)  // non-affine hidden sprite
+
+typedef struct {
+    int16_t  obj_x, obj_y;            // signed; obj_y is post Y-wrap
+    int16_t  rcx, rcy;                 // half-extent in pixels
+    int16_t  pa, pb, pc, pd;           // affine matrix; (1.0,0,0,1.0) for non-affine
+    // chr_base = 0x10000 | (chr_numb * 32); chr_numb is up to 0x3ff so the
+    // value can reach 0x17FE0 -- needs 17 bits. Storing this in a
+    // uint16_t silently truncates the 0x10000 base, sending sprites to
+    // read from the BG tile region instead of the OBJ tile region.
+    uint32_t chr_base;
+    uint16_t tys;                      // tile-row stride bytes
+    uint8_t  x_tiles, y_tiles;
+    uint8_t  priority;                 // 0..3
+    uint8_t  obj_mode;                 // 0 normal, 1 semi-trans, 2 obj-window
+    uint8_t  chr_pal;
+    uint8_t  flags;
+} DecodedObj;
+
+static DecodedObj decoded_objs[128];
+static uint8_t    obj_line_idx[160][4][OBJ_LINE_CAP];
+static uint8_t    obj_line_count[160][4];
+
+static void decode_one_obj(uint8_t idx, DecodedObj *obj) {
+    uint32_t off = (uint32_t)idx * 8u;
+    uint16_t attr0 = oam[off + 0] | (oam[off + 1] << 8);
+    uint16_t attr1 = oam[off + 2] | (oam[off + 3] << 8);
+    uint16_t attr2 = oam[off + 4] | (oam[off + 5] << 8);
+
+    bool affine     = (attr0 >>  8) & 0x1;
+    bool dbl_size   = (attr0 >>  9) & 0x1;
+    bool hidden     = (attr0 >>  9) & 0x1;
+    uint8_t obj_shp = (attr0 >> 14) & 0x3;
+    uint8_t affine_p= (attr1 >>  9) & 0x1f;
+    uint8_t obj_size= (attr1 >> 14) & 0x3;
+
+    int16_t obj_y = (attr0 >> 0) & 0xff;
+    int16_t obj_x = (attr1 >> 0) & 0x1ff;
+    obj_x <<= 7;
+    obj_x >>= 7;
+
+    bool is_256 = (attr0 >> 13) & 0x1;
+    bool flip_x = (attr1 >> 12) & 0x1;
+    bool flip_y = (attr1 >> 13) & 0x1;
+
+    obj->priority = (attr2 >> 10) & 0x3;
+    obj->obj_mode = (attr0 >> 10) & 0x3;
+    obj->chr_pal  = (attr2 >> 12) & 0xf;
+    obj->obj_x    = obj_x;
+
+    uint16_t chr_numb = attr2 & 0x3ff;
+    obj->chr_base = (uint32_t)0x10000u | ((uint32_t)chr_numb * 32u);
+
+    uint8_t lut_idx = (uint8_t)(obj_size | (obj_shp << 2));
+    uint8_t x_tiles = x_tiles_lut[lut_idx];
+    uint8_t y_tiles = y_tiles_lut[lut_idx];
+    obj->x_tiles = x_tiles;
+    obj->y_tiles = y_tiles;
+
+    int32_t rcx = x_tiles * 4;
+    int32_t rcy = y_tiles * 4;
+    if (affine && dbl_size) {
+        rcx *= 2;
+        rcy *= 2;
+    }
+    obj->rcx = (int16_t)rcx;
+    obj->rcy = (int16_t)rcy;
+
+    if (obj_y + rcy * 2 > 0xff) obj_y -= 0x100;
+    obj->obj_y = obj_y;
+
+    uint8_t tsz = is_256 ? 64 : 32;
+    obj->tys = (uint16_t)((disp_cnt.w & MAP_1D_FLAG) ? x_tiles * tsz : 1024);
+
+    uint8_t flags = 0;
+    if (affine) flags |= DECOBJ_FLAG_AFFINE;
+    if (flip_x) flags |= DECOBJ_FLAG_FLIPX;
+    if (flip_y) flags |= DECOBJ_FLAG_FLIPY;
+    if (is_256) flags |= DECOBJ_FLAG_IS256;
+    if (!affine && hidden) flags |= DECOBJ_FLAG_DROP;
+    obj->flags = flags;
+
+    if (affine) {
+        uint32_t p_base = (uint32_t)affine_p * 32u;
+        obj->pa = (int16_t)(oam[p_base + 0x06] | (oam[p_base + 0x07] << 8));
+        obj->pb = (int16_t)(oam[p_base + 0x0e] | (oam[p_base + 0x0f] << 8));
+        obj->pc = (int16_t)(oam[p_base + 0x16] | (oam[p_base + 0x17] << 8));
+        obj->pd = (int16_t)(oam[p_base + 0x1e] | (oam[p_base + 0x1f] << 8));
+    } else {
+        obj->pa = obj->pd = 0x100;
+        obj->pb = obj->pc = 0x000;
+    }
+}
+
+static void build_sprite_lists(void) {
     if (!(disp_cnt.w & OBJ_ENB)) return;
 
-    uint8_t obj_index;
-    uint32_t offset = 0x3f8;
+    // Reset counts. The lists themselves are written below; only the
+    // portion we actually push to is read by the renderer.
+    for (int y = 0; y < 160; y++) {
+        obj_line_count[y][0] = 0;
+        obj_line_count[y][1] = 0;
+        obj_line_count[y][2] = 0;
+        obj_line_count[y][3] = 0;
+    }
+
+    for (uint8_t idx = 0; idx < 128; idx++) {
+        DecodedObj *obj = &decoded_objs[idx];
+        decode_one_obj(idx, obj);
+
+        if (obj->flags & DECOBJ_FLAG_DROP) continue;
+
+        int y_start = obj->obj_y;
+        int y_end   = obj->obj_y + obj->rcy * 2;
+        if (y_end <= 0)     continue;
+        if (y_start >= 160) continue;
+        if (y_start < 0)    y_start = 0;
+        if (y_end > 160)    y_end = 160;
+
+        uint8_t prio = obj->priority;
+        for (int y = y_start; y < y_end; y++) {
+            uint8_t cnt = obj_line_count[y][prio];
+            if (cnt < OBJ_LINE_CAP) {
+                obj_line_idx[y][prio][cnt] = idx;
+                obj_line_count[y][prio] = cnt + 1;
+            }
+        }
+    }
+}
+
+// Render one already-decoded sprite at the current scanline.
+// This is the per-sprite body that used to live inline in render_obj.
+static void render_decoded_obj(const DecodedObj *obj) {
+    bool affine = obj->flags & DECOBJ_FLAG_AFFINE;
+    bool flip_x = obj->flags & DECOBJ_FLAG_FLIPX;
+    bool flip_y = obj->flags & DECOBJ_FLAG_FLIPY;
+    bool is_256 = obj->flags & DECOBJ_FLAG_IS256;
 
     uint32_t surf_addr = LINE_BYTE_OFFSET(v_count.w);
 
-    for (obj_index = 0; obj_index < 128; obj_index++) {
-        uint16_t attr0 = oam[offset + 0] | (oam[offset + 1] << 8);
-        uint16_t attr1 = oam[offset + 2] | (oam[offset + 3] << 8);
-        uint16_t attr2 = oam[offset + 4] | (oam[offset + 5] << 8);
+    int32_t y = (int32_t)v_count.w - obj->obj_y;
+    if (!affine && flip_y) y ^= (obj->y_tiles * 8) - 1;
 
-        offset -= 8;
+    int16_t pa = obj->pa;
+    int16_t pb = obj->pb;
+    int16_t pc = obj->pc;
+    int16_t pd = obj->pd;
 
-        int16_t  obj_y    = (attr0 >>  0) & 0xff;
-        bool     affine   = (attr0 >>  8) & 0x1;
-        bool     dbl_size = (attr0 >>  9) & 0x1;
-        bool     hidden   = (attr0 >>  9) & 0x1;
-        uint8_t  obj_shp  = (attr0 >> 14) & 0x3;
-        uint8_t  affine_p = (attr1 >>  9) & 0x1f;
-        uint8_t  obj_size = (attr1 >> 14) & 0x3;
-        uint8_t  chr_prio = (attr2 >> 10) & 0x3;
+    int32_t rcx = obj->rcx;
+    int32_t rcy = obj->rcy;
+    int32_t x_tiles = obj->x_tiles;
+    int32_t y_tiles = obj->y_tiles;
+    int16_t obj_x   = obj->obj_x;
 
-        if (chr_prio != prio || (!affine && hidden)) continue;
+    int32_t ox = pa * -rcx + pb * (y - rcy) + (x_tiles << 10);
+    int32_t oy = pc * -rcx + pd * (y - rcy) + (y_tiles << 10);
 
-        int16_t pa, pb, pc, pd;
+    if (!affine && flip_x) {
+        ox = (x_tiles * 8 - 1) << 8;
+        pa = -0x100;
+    }
 
-        pa = pd = 0x100; //1.0
-        pb = pc = 0x000; //0.0
+    uint32_t address = surf_addr + obj_x * 2;
+    uint32_t chr_base = obj->chr_base;
+    uint16_t tys      = obj->tys;
+    uint8_t  obj_mode = obj->obj_mode;
+    uint8_t  chr_pal  = obj->chr_pal;
+    uint8_t  lsz = is_256 ? 8 : 4;
 
-        if (affine) {
-            uint32_t p_base = affine_p * 32;
+    if (!affine) {
+        // Non-affine fast path: oy is constant across this scanline,
+        // and ox steps linearly by +/-256 per pixel (pa = +0x100 or
+        // -0x100 for flip_x). tile_y, chr_y, and the per-tile
+        // chr_addr are constant for runs of 8 pixels in the same
+        // tile. Hoist that work out of the per-pixel loop --
+        // mirrors the BG tile-coherent restructure.
+        uint16_t tile_y = oy >> 11;
+        uint16_t chr_y  = (oy >> 8) & 7;
+        int32_t  total  = rcx * 2;
+        int32_t  px     = 0;
 
-            pa = oam[p_base + 0x06] | (oam[p_base + 0x07] << 8);
-            pb = oam[p_base + 0x0e] | (oam[p_base + 0x0f] << 8);
-            pc = oam[p_base + 0x16] | (oam[p_base + 0x17] << 8);
-            pd = oam[p_base + 0x1e] | (oam[p_base + 0x1f] << 8);
-        }
+        while (px < total) {
+            if (obj_x + px >= 240) break;
 
-        uint8_t lut_idx = obj_size | (obj_shp << 2);
+            uint16_t tile_x = ox >> 11;
+            uint16_t chr_x  = (ox >> 8) & 7;
 
-        uint8_t x_tiles = x_tiles_lut[lut_idx];
-        uint8_t y_tiles = y_tiles_lut[lut_idx];
+            uint32_t chr_addr = chr_base + tile_y * tys + chr_y * lsz;
+            chr_addr += is_256 ? tile_x * 64 : tile_x * 32;
 
-        int32_t rcx = x_tiles * 4;
-        int32_t rcy = y_tiles * 4;
+            uint8_t run = (pa > 0) ? (8 - chr_x) : (chr_x + 1);
+            if (px + run > total) run = total - px;
+            if (obj_x + px + run > 240) run = 240 - (obj_x + px);
 
-        if (affine && dbl_size) {
-            rcx *= 2;
-            rcy *= 2;
-        }
+            uint32_t pal_base = !is_256 ? chr_pal * 16 : 0;
+            const uint8_t *src = vram + chr_addr;
 
-        if (obj_y + rcy * 2 > 0xff) obj_y -= 0x100;
-
-        if (obj_y <= (int32_t)v_count.w && (obj_y + rcy * 2 > v_count.w)) {
-            uint8_t  obj_mode = (attr0 >> 10) & 0x3;
-            bool     mosaic   = (attr0 >> 12) & 0x1;
-            bool     is_256   = (attr0 >> 13) & 0x1;
-            int16_t  obj_x    = (attr1 >>  0) & 0x1ff;
-            bool     flip_x   = (attr1 >> 12) & 0x1;
-            bool     flip_y   = (attr1 >> 13) & 0x1;
-            uint16_t chr_numb = (attr2 >>  0) & 0x3ff;
-            uint8_t  chr_pal  = (attr2 >> 12) & 0xf;
-
-            uint32_t chr_base = 0x10000 | chr_numb * 32;
-
-            obj_x <<= 7;
-            obj_x >>= 7;
-
-            int32_t x, y = v_count.w - obj_y;
-
-            if (!affine && flip_y) y ^= (y_tiles * 8) - 1;
-
-            uint8_t tsz = is_256 ? 64 : 32; //Tile block size (in bytes, = (8 * 8 * bpp) / 8)
-            uint8_t lsz = is_256 ?  8 :  4; //Pixel line row size (in bytes)
-
-            int32_t ox = pa * -rcx + pb * (y - rcy) + (x_tiles << 10);
-            int32_t oy = pc * -rcx + pd * (y - rcy) + (y_tiles << 10);
-
-            if (!affine && flip_x) {
-                ox = (x_tiles * 8 - 1) << 8;
-                pa = -0x100;
-            }
-
-            uint32_t tys = (disp_cnt.w & MAP_1D_FLAG) ? x_tiles * tsz : 1024; //Tile row stride
-
-            uint32_t address = surf_addr + obj_x * 2;
-
-            if (!affine) {
-                // Non-affine fast path: oy is constant across this scanline,
-                // and ox steps linearly by ±256 per pixel (pa = +0x100 or
-                // -0x100 for flip_x). tile_y, chr_y, and the per-tile
-                // chr_addr are constant for runs of 8 pixels in the same
-                // tile. Hoist that work out of the per-pixel loop —
-                // mirrors the BG tile-coherent restructure.
-                uint16_t tile_y = oy >> 11;
-                uint16_t chr_y  = (oy >> 8) & 7;
-                int32_t  total  = rcx * 2;  // sprite width in pixels
-                int32_t  px     = 0;
-
-                while (px < total) {
-                    if (obj_x + px >= 240) break;
-
-                    uint16_t tile_x = ox >> 11;
-                    uint16_t chr_x  = (ox >> 8) & 7;
-
-                    uint32_t chr_addr = chr_base + tile_y * tys + chr_y * lsz;
-                    chr_addr += is_256 ? tile_x * 64 : tile_x * 32;
-
-                    // Number of pixels until the chr_x walk exits this tile,
-                    // or until we hit a clip edge.
-                    uint8_t run = (pa > 0) ? (8 - chr_x) : (chr_x + 1);
-                    if (px + run > total) run = total - px;
-                    if (obj_x + px + run > 240) run = 240 - (obj_x + px);
-
-                    uint32_t pal_base = !is_256 ? chr_pal * 16 : 0;
-                    uint8_t  *src = vram + chr_addr;
-
-                    for (uint8_t i = 0; i < run; i++) {
-                        int16_t sx = obj_x + px + i;
-                        if (sx < 0) continue;  // off-screen left
-
-                        uint8_t cx = (pa > 0) ? (chr_x + i) : (chr_x - i);
-
-                        uint8_t pal_idx = is_256
-                            ? src[cx]
-                            : ((src[cx >> 1] >> ((cx & 1) * 4)) & 0xf);
-
-                        if (pal_idx
-                            && (!windows_active || (layer_mask[sx] & 0x10))) {
-                            uint32_t pal_addr = 0x100 | pal_idx | pal_base;
-                            write_obj_pixel((uint8_t *)screen,
-                                            address + i * 2,
-                                            palette[pal_addr],
-                                            (uint8_t)sx, obj_mode);
-                        }
-                    }
-
-                    px      += run;
-                    ox      += (int32_t)pa * run;
-                    address += run * 2;
-                }
+            // Pre-decode the 8 palette indices for this tile row. See
+            // the matching block in render_bg's tile-coherent path for
+            // the rationale -- skips the per-pixel shift+mask in 4bpp.
+            uint8_t row_pal[8];
+            if (is_256) {
+                row_pal[0] = src[0]; row_pal[1] = src[1];
+                row_pal[2] = src[2]; row_pal[3] = src[3];
+                row_pal[4] = src[4]; row_pal[5] = src[5];
+                row_pal[6] = src[6]; row_pal[7] = src[7];
             } else {
-                // Affine sprites: ox/oy advance by pa/pc/pb/pd per pixel
-                // and don't have linear tile coherence, so keep the
-                // per-pixel loop.
-                for (x = 0; x < rcx * 2;
-                    x++,
-                    ox += pa,
-                    oy += pc,
-                    address += 2) {
-                    if (obj_x + x < 0) continue;
-                    if (obj_x + x >= 240) break;
+                uint8_t b;
+                b = src[0]; row_pal[0] = b & 0xf; row_pal[1] = b >> 4;
+                b = src[1]; row_pal[2] = b & 0xf; row_pal[3] = b >> 4;
+                b = src[2]; row_pal[4] = b & 0xf; row_pal[5] = b >> 4;
+                b = src[3]; row_pal[6] = b & 0xf; row_pal[7] = b >> 4;
+            }
 
-                    uint32_t vram_addr;
-                    uint32_t pal_idx;
+            for (uint8_t i = 0; i < run; i++) {
+                int16_t sx = obj_x + px + i;
+                if (sx < 0) continue;
 
-                    uint16_t tile_x = ox >> 11;
-                    uint16_t tile_y = oy >> 11;
+                uint8_t cx = (pa > 0) ? (chr_x + i) : (chr_x - i);
 
-                    if (ox < 0 || tile_x >= x_tiles) continue;
-                    if (oy < 0 || tile_y >= y_tiles) continue;
+                uint8_t pal_idx = row_pal[cx];
 
-                    uint16_t chr_x = (ox >> 8) & 7;
-                    uint16_t chr_y = (oy >> 8) & 7;
-
-                    uint32_t chr_addr =
-                        chr_base       +
-                        tile_y   * tys +
-                        chr_y    * lsz;
-
-                    if (is_256) {
-                        vram_addr = chr_addr + tile_x * 64 + chr_x;
-                        pal_idx   = vram[vram_addr];
-                    } else {
-                        vram_addr = chr_addr + tile_x * 32 + (chr_x >> 1);
-                        pal_idx   = (vram[vram_addr] >> (chr_x & 1) * 4) & 0xf;
-                    }
-
-                    uint32_t pal_addr = 0x100 | pal_idx | (!is_256 ? chr_pal * 16 : 0);
-
-                    if (pal_idx
-                        && (!windows_active || (layer_mask[obj_x + x] & 0x10)))
-                        write_obj_pixel((uint8_t *)screen, address,
-                                        palette[pal_addr],
-                                        (uint8_t)(obj_x + x), obj_mode);
+                if (pal_idx
+                    && (!windows_active || (layer_mask[sx] & 0x10))) {
+                    uint32_t pal_addr = 0x100 | pal_idx | pal_base;
+                    write_obj_pixel((uint8_t *)screen,
+                                    address + i * 2,
+                                    palette[pal_addr],
+                                    (uint8_t)sx, obj_mode);
                 }
             }
+
+            px      += run;
+            ox      += (int32_t)pa * run;
+            address += run * 2;
         }
+    } else {
+        // Affine sprites: ox/oy advance by pa/pc/pb/pd per pixel
+        // and don't have linear tile coherence, so keep the per-
+        // pixel loop.
+        for (int32_t x = 0; x < rcx * 2;
+             x++, ox += pa, oy += pc, address += 2) {
+            if (obj_x + x < 0)   continue;
+            if (obj_x + x >= 240) break;
+
+            uint16_t tile_x = ox >> 11;
+            uint16_t tile_y = oy >> 11;
+
+            if (ox < 0 || tile_x >= x_tiles) continue;
+            if (oy < 0 || tile_y >= y_tiles) continue;
+
+            uint16_t chr_x = (ox >> 8) & 7;
+            uint16_t chr_y = (oy >> 8) & 7;
+
+            uint32_t chr_addr = chr_base + tile_y * tys + chr_y * lsz;
+
+            uint32_t vram_addr;
+            uint32_t pal_idx;
+            if (is_256) {
+                vram_addr = chr_addr + tile_x * 64 + chr_x;
+                pal_idx   = vram[vram_addr];
+            } else {
+                vram_addr = chr_addr + tile_x * 32 + (chr_x >> 1);
+                pal_idx   = (vram[vram_addr] >> (chr_x & 1) * 4) & 0xf;
+            }
+
+            uint32_t pal_addr = 0x100 | pal_idx | (!is_256 ? chr_pal * 16 : 0);
+
+            if (pal_idx
+                && (!windows_active || (layer_mask[obj_x + x] & 0x10)))
+                write_obj_pixel((uint8_t *)screen, address,
+                                palette[pal_addr],
+                                (uint8_t)(obj_x + x), obj_mode);
+        }
+    }
+}
+
+static void render_obj(uint8_t prio) {
+    if (!(disp_cnt.w & OBJ_ENB)) return;
+
+    uint8_t y = v_count.w;
+    int n = obj_line_count[y][prio];
+
+    // Iterate in REVERSE list order: highest OAM index pushed last,
+    // drawn first (back); lowest pushed first, drawn last (front).
+    // Matches the GBA's lower-OAM-on-top convention within a priority.
+    for (int i = n - 1; i >= 0; i--) {
+        uint8_t idx = obj_line_idx[y][prio][i];
+        render_decoded_obj(&decoded_objs[idx]);
     }
 }
 
@@ -578,6 +708,28 @@ static void render_bg() {
                                 ? chr_base + chr_numb * 64 + chr_y * 8
                                 : chr_base + chr_numb * 32 + chr_y * 4;
 
+                            // Pre-decode all 8 palette indices for this
+                            // tile row. The hot loop below is then a
+                            // bare table lookup -- in 4bpp this lifts
+                            // the per-pixel shift+mask out of the inner
+                            // loop; in 8bpp it doesn't help much by
+                            // itself but keeps the flip / window /
+                            // pal_idx==0 branches uniform.
+                            uint8_t row_pal[8];
+                            const uint8_t *row = vram + tile_base;
+                            if (is_256) {
+                                row_pal[0] = row[0]; row_pal[1] = row[1];
+                                row_pal[2] = row[2]; row_pal[3] = row[3];
+                                row_pal[4] = row[4]; row_pal[5] = row[5];
+                                row_pal[6] = row[6]; row_pal[7] = row[7];
+                            } else {
+                                uint8_t b;
+                                b = row[0]; row_pal[0] = b & 0xf; row_pal[1] = b >> 4;
+                                b = row[1]; row_pal[2] = b & 0xf; row_pal[3] = b >> 4;
+                                b = row[2]; row_pal[4] = b & 0xf; row_pal[5] = b >> 4;
+                                b = row[3]; row_pal[6] = b & 0xf; row_pal[7] = b >> 4;
+                            }
+
                             // How many pixels of this tile fall on screen.
                             uint8_t pixels = 8 - cx_start;
                             if (x + pixels > 240) pixels = 240 - x;
@@ -587,13 +739,7 @@ static void render_bg() {
                                 uint16_t cx = cx_start + i;
                                 if (flip_x) cx ^= 7;
 
-                                uint16_t pal_idx;
-                                if (is_256) {
-                                    pal_idx = vram[tile_base + cx];
-                                } else {
-                                    pal_idx = (vram[tile_base + (cx >> 1)]
-                                               >> (cx & 1) * 4) & 0xf;
-                                }
+                                uint8_t pal_idx = row_pal[cx];
 
                                 if (pal_idx
                                     && (!windows_active
@@ -759,6 +905,11 @@ void run_frame() {
         }
     }
     bool need_hblank_split = hblank_irq_on || hblank_dma_on;
+
+    // Decode OAM into per-(scanline, priority) sprite lists once for
+    // this frame. Skipped when frame is being skipped -- nothing reads
+    // the lists in that case.
+    if (render_this_frame) build_sprite_lists();
 
     disp_stat.w &= ~VBLK_FLAG;
 
