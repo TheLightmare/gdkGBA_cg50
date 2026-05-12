@@ -5,6 +5,12 @@
 #include <gint/bfile.h>
 #include <gint/gint.h>
 
+#include "build_flags.h"
+#if GBA_FXLINK
+#  include <gint/usb.h>
+#  include <gint/usb-ff-bulk.h>
+#endif
+
 #include "gint_gba.h"
 //===============
 
@@ -17,6 +23,7 @@
 #include "build_flags.h"
 #include "mem_swizzle.h"
 #include "rom_buffer.h"
+#include "save_file.h"
 #include "thumb_block.h"
 #include "extram.h"
 
@@ -108,6 +115,10 @@ int main(void) {
     // Allocate the Thumb block cache. Failure is not fatal -- the
     // interpreter runs unchanged when thumb_block_enabled stays false.
     thumb_block_init();
+
+    // Allocate the fit-to-screen source backup buffer (76 KB, prefers
+    // extram). Failure is silent; fit mode just stays a no-op.
+    gba_fit_init();
 
 
     //TODO : make an actual ROM select menu
@@ -262,6 +273,28 @@ int main(void) {
 
     arm_reset();
 
+    // Derive the .sav path from the ROM path and try to load any existing
+    // save file. Failure is silent: a missing or malformed file just means
+    // the game starts with a blank save, which is the desired behaviour for
+    // first-time runs.
+    char save_path[80];
+    bool have_save_path =
+        save_make_path(rom_path, save_path, sizeof(save_path));
+    if (have_save_path) save_load(save_path);
+
+#if GBA_FXLINK
+    // Bring up the USB bulk interface for fxlink screen streaming. This
+    // MUST happen after all init-time fopen/fread (BIOS, ROM, save) --
+    // those world-switch to Casio OS, which clobbers gint's USB pipe state
+    // and causes the device to renumerate after the first transfer.
+    // Subsequent world switches (rom-buffer chunk loads, periodic save
+    // flushes) will still cause occasional disconnects; running fxlink
+    // with -r lets it auto-reconnect.
+    usb_interface_t const *interfaces[] = { &usb_ff_bulk, NULL };
+    usb_open(interfaces, GINT_CALL_NULL);
+    usb_open_wait();
+#endif
+
 
 #if GBA_DIAG_LOG
     // One-shot BIOS + cart dump to log file at boot.
@@ -362,6 +395,18 @@ int main(void) {
     dupdate();
 
     bool run = true;
+
+    // Auto-save bookkeeping. save_dirty is set by writes into the save
+    // region (see save_mark_dirty in arm_mem.c). We debounce: each time we
+    // observe dirty we re-arm a quiescence countdown, and only flush after
+    // SAVE_QUIESCENT_FRAMES of no further activity. This collapses the
+    // burst of writes during an in-game save into one disk write, and
+    // avoids hitting storage on every byte the game flushes.
+    uint32_t save_frame             = 0;
+    uint32_t save_last_dirty_frame  = 0;
+    bool     save_pending           = false;
+    const uint32_t SAVE_QUIESCENT_FRAMES = 60;
+
 #if GBA_DIAG_LOG
     uint32_t loop_frame = 0;
     int dumps_done = 0;
@@ -407,12 +452,42 @@ int main(void) {
         bench_last_frame_us = frame_us;
 #endif
 
+        // Debounced auto-save. The write paths set save_dirty; we re-arm
+        // the quiescence window on each observation. When no save-region
+        // writes have happened for SAVE_QUIESCENT_FRAMES we flush. The
+        // disk write happens between guest frames, so the worst-case stall
+        // lands in idle time rather than mid-scene.
+        save_frame++;
+        if (save_dirty) {
+            save_dirty = false;
+            save_last_dirty_frame = save_frame;
+            save_pending = true;
+        }
+        if (save_pending && have_save_path &&
+            (save_frame - save_last_dirty_frame) >= SAVE_QUIESCENT_FRAMES) {
+            save_write(save_path);
+            save_pending = false;
+        }
+
         clearevents();
 
         if (keydown(KEY_MENU) || keydown(KEY_EXIT)) {
             run = false;
             continue;
         }
+
+        // F2 toggles fit-to-screen mode. Edge-detect so a held key
+        // only flips once. On transition we wipe gint_vram so leftover
+        // pixels from the previous mode's larger region don't bleed
+        // into the new mode's margins.
+        static bool f2_was_down = false;
+        bool f2_now = keydown(KEY_F2);
+        if (f2_now && !f2_was_down) {
+            gba_fit_to_screen = !gba_fit_to_screen;
+            dclear(C_BLACK);
+            dupdate();
+        }
+        f2_was_down = f2_now;
 
 #if GBA_DIAG_LOG
         // F3 = manual bench snapshot. Edge-detect so a held key only
@@ -671,6 +746,13 @@ int main(void) {
             }
         }
 #endif // GBA_DIAG_LOG
+    }
+
+    // Final save flush on graceful exit. Always attempt the write if the
+    // game ever touched the save region (covers the case where the player
+    // saved in-game less than SAVE_QUIESCENT_FRAMES before exiting).
+    if (have_save_path && (save_dirty || save_pending)) {
+        save_write(save_path);
     }
 
     // Clean up ROM buffer resources

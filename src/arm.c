@@ -3031,8 +3031,20 @@ static void hle_div(void) {
 
 static void hle_register_ram_reset(void) {
     uint32_t flags = arm_r.r[0];
-    if (flags & 0x01) memset(wram_board,  0, ewram_size);
-    if (flags & 0x02) memset(wram_chip,   0, sizeof(wram_chip) - 0x200);
+    if (flags & 0x01) {
+        memset(wram_board, 0, ewram_size);
+        // Phase 4c: raw memset bypasses arm_write*, so invalidate any
+        // cached Thumb blocks covering this region directly.
+        for (uint32_t a = 0; a < ewram_size; a += 256) {
+            thumb_block_invalidate_page(0x02000000u + a);
+        }
+    }
+    if (flags & 0x02) {
+        memset(wram_chip, 0, sizeof(wram_chip) - 0x200);
+        for (uint32_t a = 0; a < sizeof(wram_chip) - 0x200; a += 256) {
+            thumb_block_invalidate_page(0x03000000u + a);
+        }
+    }
     if (flags & 0x04) memset(palette_ram, 0, sizeof(palette_ram));
     if (flags & 0x08) memset(vram,        0, sizeof(vram));
     if (flags & 0x10) memset(oam,         0, sizeof(oam));
@@ -3806,6 +3818,90 @@ void t16_dec_asr_imm5(const thumb_uop_t *uop) {
     arm_asr(op);
 }
 
+// LDR Rd, [Rn, #imm5*4] -- arg_a=Rd, arg_b=Rn, arg_c=imm5*4 (pre-scaled)
+void t16_dec_ldr_imm5(const thumb_uop_t *uop) {
+    arm_memio_t op = {
+        .rt   = uop->arg_a,
+        .addr = arm_r.r[uop->arg_b] + uop->arg_c,
+    };
+    arm_memio_ldr(op);
+}
+
+// STR Rd, [Rn, #imm5*4] -- same operand layout as LDR
+void t16_dec_str_imm5(const thumb_uop_t *uop) {
+    arm_memio_t op = {
+        .rt   = uop->arg_a,
+        .addr = arm_r.r[uop->arg_b] + uop->arg_c,
+    };
+    arm_memio_str(op);
+}
+
+// LDR Rd, [PC, #imm8*4] -- constant pool access. Address depends on
+// runtime R15 (set per-instruction by the executor); we just need
+// arg_a=Rd and arg_b=imm8 (pre-scaled to imm8*4 stored as uint16_t).
+void t16_dec_ldr_pc8(const thumb_uop_t *uop) {
+    uint32_t addr = (arm_r.r[15] & ~3u) + uop->arg_c;
+    arm_memio_t op = { .rt = uop->arg_a, .addr = addr };
+    arm_memio_ldr(op);
+}
+
+// ADD Rd, Rn, #imm3 -- arg_a=Rd, arg_b=Rn, arg_c=imm3
+void t16_dec_add_imm3(const thumb_uop_t *uop) {
+    arm_data_t op = {
+        .rd   = uop->arg_a,
+        .lhs  = arm_r.r[uop->arg_b],
+        .rhs  = uop->arg_c,
+        .cout = false,
+        .s    = true,
+    };
+    arm_arith_add(op, ARM_ARITH_NO_C);
+}
+
+// SUB Rd, Rn, #imm3 -- arg_a=Rd, arg_b=Rn, arg_c=imm3
+void t16_dec_sub_imm3(const thumb_uop_t *uop) {
+    arm_data_t op = {
+        .rd   = uop->arg_a,
+        .lhs  = arm_r.r[uop->arg_b],
+        .rhs  = uop->arg_c,
+        .cout = false,
+        .s    = true,
+    };
+    arm_arith_sub(op);
+}
+
+// ADD Rd, Rn, Rm -- arg_a=Rd, arg_b=Rn, arg_c=Rm
+void t16_dec_add_reg(const thumb_uop_t *uop) {
+    arm_data_t op = {
+        .rd   = uop->arg_a,
+        .lhs  = arm_r.r[uop->arg_b],
+        .rhs  = arm_r.r[uop->arg_c],
+        .cout = false,
+        .s    = true,
+    };
+    arm_arith_add(op, ARM_ARITH_NO_C);
+}
+
+// SUB Rd, Rn, Rm -- arg_a=Rd, arg_b=Rn, arg_c=Rm
+void t16_dec_sub_reg(const thumb_uop_t *uop) {
+    arm_data_t op = {
+        .rd   = uop->arg_a,
+        .lhs  = arm_r.r[uop->arg_b],
+        .rhs  = arm_r.r[uop->arg_c],
+        .cout = false,
+        .s    = true,
+    };
+    arm_arith_sub(op);
+}
+
+// B #imm11 -- unconditional branch. arg_c holds the sign-extended
+// (imm11 << 1) byte offset, in [-2048, +2046]. Block-ending.
+void t16_dec_b_imm11(const thumb_uop_t *uop) {
+    int32_t imm = (int16_t)uop->arg_c;
+    arm_r.r[15] += imm;
+    arm_load_pipe();
+    if (imm == -4) int_halt = true;   // tight `b .` idle spin
+}
+
 // Fallback for any opcode without a specialised handler. Restores the
 // arm_op global and dispatches into the existing handler table -- same
 // effect as Phase 4a's executor, just routed through the new handler
@@ -3831,6 +3927,15 @@ void arm_init() {
     eeprom = malloc(0x2000);
     sram   = malloc(0x10000);
     flash  = NULL;
+
+    // Real EEPROM/SRAM chips read 0xFF on bytes that have never been
+    // written. Games rely on this -- e.g. Minish Cap's title screen
+    // checks each save slot's checksum and flags unwritten slots as
+    // "corrupted" if they don't look pristine. malloc returns garbage,
+    // so seed both buffers to the fresh-chip state. save_load() will
+    // overwrite this when an existing .sav is found.
+    if (eeprom) memset(eeprom, 0xff, 0x2000);
+    if (sram)   memset(sram,   0xff, 0x10000);
 
     arm_proc_init();
     thumb_proc_init();

@@ -14,6 +14,10 @@
 //                     Implies GBA_BENCH (snapshots read bench accumulators).
 //   GBA_TRACE         PC trace, undef/SWI/HLE-IRQ counts, first-low tripwire.
 //                     Compatible with the legacy ARM_TRACE_ENABLE switch.
+//   GBA_FXLINK        Open the USB bulk interface and push each emulator
+//                     frame to fxlink for live screen streaming on the host
+//                     (`fxlink -ivr`). Off by default; turn on with
+//                     `-DGBA_FXLINK=ON` when invoking cmake.
 
 #ifndef GBA_BENCH
 #  define GBA_BENCH 0
@@ -26,6 +30,9 @@
 #endif
 #ifndef GBA_TRACE
 #  define GBA_TRACE 0
+#endif
+#ifndef GBA_FXLINK
+#  define GBA_FXLINK 0
 #endif
 
 // GBA_DIAG_LOG snapshots dump bench accumulators and the arm trace state

@@ -8,6 +8,8 @@
 #include "io.h"
 #include "mem_swizzle.h"
 #include "rom_buffer.h"
+#include "save_file.h"
+#include "thumb_block.h"
 #include "extram.h"
 
 #include <gint/kmalloc.h>
@@ -615,6 +617,7 @@ static void eeprom_write(uint32_t address, uint8_t offset, uint8_t value) {
         }
 
         eeprom_used = true;
+        save_mark_dirty();
     }
 }
 
@@ -675,6 +678,11 @@ static void flash_write(uint32_t address, uint8_t value) {
     }
 
     sram[address & 0xffff] = value;
+    // Any write into the 0x0E.. region is either real SRAM data or a flash
+    // command/data byte; in both cases the active save buffer is now stale.
+    // Debouncing in main.c keeps the SRAM-mirrored flash command bursts
+    // (0xAA/0x55 sequences) from triggering a flush per byte.
+    save_mark_dirty();
 }
 
 static void arm_write_(uint32_t address, uint8_t offset, uint8_t value) {
@@ -704,12 +712,16 @@ void arm_writeb(uint32_t address, uint8_t value) {
     if (ah == 7) return;
 
     // Fast path: EWRAM/IWRAM byte writes go to the host-swizzled buffers.
+    // Phase 4c: also bump the page-gen counter so any cached Thumb block
+    // covering this page is detected as stale on the next lookup.
     if (ah == 0x03) {
         mem_swz_write_b(wram_chip, address & 0x7FFF, value);
+        thumb_block_invalidate_page(address);
         return;
     }
     if (ah == 0x02) {
         mem_swz_write_b(wram_board, address & ewram_mask, value);
+        thumb_block_invalidate_page(address);
         return;
     }
     // Other page-table regions (only OAM remains writable through here,
@@ -747,13 +759,16 @@ void arm_writeh(uint32_t address, uint16_t value) {
     uint32_t ah = (a >> 24) & 0xFF;
 
     // Fast path: EWRAM/IWRAM halfword writes go to the host-swizzled
-    // buffers as a single 16-bit store.
+    // buffers as a single 16-bit store. Phase 4c: invalidate any cached
+    // Thumb block covering this page.
     if (ah == 0x03) {
         mem_swz_write_h(wram_chip, a & 0x7FFF, value);
+        thumb_block_invalidate_page(a);
         return;
     }
     if (ah == 0x02) {
         mem_swz_write_h(wram_board, a & ewram_mask, value);
+        thumb_block_invalidate_page(a);
         return;
     }
     // Other page-table regions (OAM keeps the byte-store path).
@@ -799,13 +814,16 @@ void arm_write(uint32_t address, uint32_t value) {
     uint32_t ah = (a >> 24) & 0xFF;
 
     // Fast path: EWRAM/IWRAM word writes go to the host-swizzled buffers
-    // as a single 32-bit store.
+    // as a single 32-bit store. Phase 4c: invalidate any cached Thumb
+    // block covering this page.
     if (ah == 0x03) {
         mem_swz_write_w(wram_chip, a & 0x7FFF, value);
+        thumb_block_invalidate_page(a);
         return;
     }
     if (ah == 0x02) {
         mem_swz_write_w(wram_board, a & ewram_mask, value);
+        thumb_block_invalidate_page(a);
         return;
     }
     // Other page-table regions (OAM keeps the byte-store path).

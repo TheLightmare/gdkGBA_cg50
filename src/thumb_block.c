@@ -5,9 +5,10 @@
 
 #include <gint/kmalloc.h>
 
-#include "arm_mem.h"      // rom_buffer global
+#include "arm_mem.h"      // rom_buffer, wram_chip, wram_board, ewram_mask
 #include "extram.h"
 #include "io.h"           // ws_s_t16
+#include "mem_swizzle.h"
 #include "rom_buffer.h"   // rom_buffer_read_16_fast
 
 bool thumb_block_enabled = false;
@@ -15,6 +16,50 @@ thumb_block_t *thumb_block_dir   = NULL;
 thumb_uop_t   *thumb_uop_pool    = NULL;
 uint16_t       thumb_block_current_gen = 1;
 static uint32_t thumb_uop_pool_head = 0;
+
+// Page-generation tracking for RAM-resident blocks.
+//
+// A "page" is 256 bytes. Pages 0..127 cover IWRAM (32 KB), pages
+// 128..1151 cover EWRAM (256 KB max). The arm_mem.c write paths bump
+// the gen for the page they wrote into; cached RAM blocks store the
+// page gen they saw at decode time, and the lookup compares it
+// against the current gen to detect overwrites.
+//
+// uint16_t means a page can be written 65535 times before the gen
+// counter wraps. After wrap, a stale block whose stored gen happens
+// to match the current gen would falsely pass the freshness check
+// (cart misbehaves until the block is naturally evicted by pool
+// rotation -- not a correctness issue per se but worth knowing).
+#define THUMB_PAGE_BITS    8u
+#define THUMB_PAGE_SIZE    (1u << THUMB_PAGE_BITS)
+#define THUMB_PAGE_MASK    (THUMB_PAGE_SIZE - 1u)
+#define THUMB_IWRAM_PAGES  (0x8000u / THUMB_PAGE_SIZE)        // 128
+#define THUMB_EWRAM_PAGES  (0x40000u / THUMB_PAGE_SIZE)       // 1024
+#define THUMB_TOTAL_PAGES  (THUMB_IWRAM_PAGES + THUMB_EWRAM_PAGES)
+#define THUMB_PAGE_NONE    0xFFFFu
+
+static uint16_t thumb_page_gen[THUMB_TOTAL_PAGES];
+
+// Map a guest address to its page index in thumb_page_gen, or
+// THUMB_PAGE_NONE for non-RAM regions.
+static inline uint16_t ram_page_idx(uint32_t addr) {
+    uint8_t reg = (addr >> 24) & 0xFu;
+    if (reg == 0x03) {
+        return (uint16_t)((addr & 0x7FFFu) >> THUMB_PAGE_BITS);
+    }
+    if (reg == 0x02) {
+        return (uint16_t)(THUMB_IWRAM_PAGES +
+                          ((addr & ewram_mask) >> THUMB_PAGE_BITS));
+    }
+    return THUMB_PAGE_NONE;
+}
+
+void thumb_block_invalidate_page(uint32_t addr) {
+    uint16_t idx = ram_page_idx(addr);
+    if (idx != THUMB_PAGE_NONE) {
+        thumb_page_gen[idx]++;
+    }
+}
 
 // thumb_proc[] is defined in arm.c. The Phase 4b legacy fallback
 // handler dispatches through it for opcodes without a specialised
@@ -30,6 +75,14 @@ extern void t16_dec_sub_imm8 (const thumb_uop_t *uop);
 extern void t16_dec_lsl_imm5 (const thumb_uop_t *uop);
 extern void t16_dec_lsr_imm5 (const thumb_uop_t *uop);
 extern void t16_dec_asr_imm5 (const thumb_uop_t *uop);
+extern void t16_dec_ldr_imm5 (const thumb_uop_t *uop);
+extern void t16_dec_str_imm5 (const thumb_uop_t *uop);
+extern void t16_dec_ldr_pc8  (const thumb_uop_t *uop);
+extern void t16_dec_add_imm3 (const thumb_uop_t *uop);
+extern void t16_dec_sub_imm3 (const thumb_uop_t *uop);
+extern void t16_dec_add_reg  (const thumb_uop_t *uop);
+extern void t16_dec_sub_reg  (const thumb_uop_t *uop);
+extern void t16_dec_b_imm11  (const thumb_uop_t *uop);
 extern void t16_dec_call_legacy(const thumb_uop_t *uop);
 
 // Pick the right uop handler for `op` and fill in the operand fields it
@@ -68,6 +121,25 @@ static void decode_thumb_op(uint16_t op, thumb_uop_t *out) {
             imm5 = (op >> 6) & 0x1f;
             out->arg_c   = (imm5 == 0) ? 32 : imm5;
             return;
+        case 0b00011: {
+            // ADD/SUB reg or imm3:
+            //   bit 10 = I (1 = immediate, 0 = register)
+            //   bit 9  = Op (0 = ADD, 1 = SUB)
+            //   bits[8:6] = imm3 or Rm
+            //   bits[5:3] = Rn
+            //   bits[2:0] = Rd
+            bool is_imm = (op >> 10) & 1;
+            bool is_sub = (op >>  9) & 1;
+            out->arg_a = op & 0x7;
+            out->arg_b = (op >> 3) & 0x7;
+            out->arg_c = (op >> 6) & 0x7;
+            if (is_imm) {
+                out->handler = is_sub ? t16_dec_sub_imm3 : t16_dec_add_imm3;
+            } else {
+                out->handler = is_sub ? t16_dec_sub_reg  : t16_dec_add_reg;
+            }
+            return;
+        }
         case 0b00100:  // MOV Rd, #imm8
             out->handler = t16_dec_mov_imm8;
             out->arg_a   = (op >> 8) & 0x7;
@@ -88,6 +160,33 @@ static void decode_thumb_op(uint16_t op, thumb_uop_t *out) {
             out->arg_a   = (op >> 8) & 0x7;
             out->arg_b   = op & 0xff;
             return;
+        case 0b01001:  // LDR Rd, [PC, #imm8*4]
+            out->handler = t16_dec_ldr_pc8;
+            out->arg_a   = (op >> 8) & 0x7;
+            out->arg_c   = (uint16_t)((op & 0xff) << 2);
+            return;
+        case 0b01100:  // STR Rd, [Rn, #imm5*4]
+            out->handler = t16_dec_str_imm5;
+            out->arg_a   = op & 0x7;
+            out->arg_b   = (op >> 3) & 0x7;
+            out->arg_c   = (uint16_t)(((op >> 6) & 0x1f) << 2);
+            return;
+        case 0b01101:  // LDR Rd, [Rn, #imm5*4]
+            out->handler = t16_dec_ldr_imm5;
+            out->arg_a   = op & 0x7;
+            out->arg_b   = (op >> 3) & 0x7;
+            out->arg_c   = (uint16_t)(((op >> 6) & 0x1f) << 2);
+            return;
+        case 0b11100: {
+            // B #imm11 -- compute the sign-extended (imm11 << 1) byte
+            // offset at decode time. Range is [-2048, +2046], fits in
+            // int16_t. Stored as uint16_t; the handler casts back to
+            // int16_t to recover the sign.
+            int32_t imm = ((int32_t)((uint32_t)op << 21)) >> 20;
+            out->handler = t16_dec_b_imm11;
+            out->arg_c   = (uint16_t)imm;
+            return;
+        }
         default:
             out->handler = t16_dec_call_legacy;
             return;
@@ -144,6 +243,14 @@ bool thumb_block_init(void) {
         thumb_block_dir[i].total_cycles = 0;
         thumb_block_dir[i].ops_offset   = 0;
         thumb_block_dir[i].generation   = 0;
+        thumb_block_dir[i].page_idx     = THUMB_PAGE_NONE;
+        thumb_block_dir[i].page_gen     = 0;
+    }
+
+    // Reset all page generations. Static BSS already zero, but be
+    // explicit -- we'll bump these on every RAM write.
+    for (uint32_t i = 0; i < THUMB_TOTAL_PAGES; i++) {
+        thumb_page_gen[i] = 0;
     }
 
     thumb_uop_pool_head      = 0;
@@ -161,20 +268,60 @@ void thumb_block_uninit(void) {
 const thumb_block_t *thumb_block_lookup(uint32_t inst_pc) {
     if (!thumb_block_enabled) return NULL;
     uint8_t reg = (inst_pc >> 24) & 0xFu;
-    if (reg < 0x8 || reg > 0xD) return NULL;
+    bool is_rom = (reg >= 0x8 && reg <= 0xD);
+    bool is_ram = (reg == 0x02 || reg == 0x03);
+    if (!is_rom && !is_ram) return NULL;
 
     thumb_block_t *b = &thumb_block_dir[thumb_block_hash(inst_pc)];
-    if (b->start_pc == inst_pc &&
-        b->generation == thumb_block_current_gen) {
-        return b;
+    if (b->start_pc != inst_pc) return NULL;
+    if (b->generation != thumb_block_current_gen) return NULL;
+
+    // For RAM blocks, also confirm the page hasn't been written to since
+    // we decoded. ROM blocks have page_idx == THUMB_PAGE_NONE and skip
+    // this check.
+    if (b->page_idx != THUMB_PAGE_NONE) {
+        if (thumb_page_gen[b->page_idx] != b->page_gen) return NULL;
     }
-    return NULL;
+
+    return b;
+}
+
+// Read a Thumb halfword for the decoder. ROM goes through the Phase 1
+// chunk cache; IWRAM/EWRAM go through the swizzled fast path.
+static inline uint16_t decode_read_op(uint32_t pc) {
+    uint8_t reg = (pc >> 24) & 0xFu;
+    if (reg >= 0x8 && reg <= 0xD) {
+        return rom_buffer_read_16_fast(&rom_buffer, pc);
+    }
+    if (reg == 0x03) {
+        return mem_swz_read_h(wram_chip, pc & 0x7FFFu);
+    }
+    if (reg == 0x02) {
+        return mem_swz_read_h(wram_board, pc & ewram_mask);
+    }
+    return 0;
 }
 
 const thumb_block_t *thumb_block_decode(uint32_t inst_pc) {
     if (!thumb_block_enabled) return NULL;
     uint8_t reg = (inst_pc >> 24) & 0xFu;
-    if (reg < 0x8 || reg > 0xD) return NULL;
+    bool is_rom = (reg >= 0x8 && reg <= 0xD);
+    bool is_ram = (reg == 0x02 || reg == 0x03);
+    if (!is_rom && !is_ram) return NULL;
+
+    // For RAM blocks, snapshot the page identity + generation now so
+    // the lookup-side freshness check has something to compare. The
+    // block decoder also caps the block at the next 256-byte page
+    // boundary so we never need to track per-page state for >1 page.
+    uint16_t page_idx = THUMB_PAGE_NONE;
+    uint16_t page_gen = 0;
+    uint32_t page_end_pc = 0xFFFFFFFFu;
+    if (is_ram) {
+        page_idx = ram_page_idx(inst_pc);
+        if (page_idx == THUMB_PAGE_NONE) return NULL;  // shouldn't hit
+        page_gen = thumb_page_gen[page_idx];
+        page_end_pc = (inst_pc | THUMB_PAGE_MASK) + 1u;
+    }
 
     // Reserve pool space. If we'd exceed the pool, wrap the head and bump
     // the generation -- every directory entry referencing the soon-to-be-
@@ -191,16 +338,24 @@ const thumb_block_t *thumb_block_decode(uint32_t inst_pc) {
     uint32_t pc = inst_pc;
     uint16_t length = 0;
     uint16_t total_cycles = 0;
-    uint8_t  region_ws = ws_s_t16[(pc >> 25) & 3];
+    // Cycle cost per instruction in this region. For ROM regions, this
+    // is the cart's WAITCNT-derived value; RAM is fast (1 for IWRAM,
+    // 3 for EWRAM as approximated by ws_s_t16's index 0 fallback).
+    uint8_t  region_ws;
+    if (is_rom) region_ws = ws_s_t16[(pc >> 25) & 3];
+    else if (reg == 0x03) region_ws = 1;     // IWRAM: 1-cycle access
+    else                  region_ws = 3;     // EWRAM: bus is 16-bit, slow
 
-    while (length < THUMB_BLOCK_MAX_LEN) {
+    while (length < THUMB_BLOCK_MAX_LEN && pc < page_end_pc) {
         uint8_t r = (pc >> 24) & 0xFu;
-        if (r < 0x8 || r > 0xD) break;
+        bool r_rom = (r >= 0x8 && r <= 0xD);
+        bool r_ram = (r == 0x02 || r == 0x03);
+        // Bail if we'd cross out of the start region (e.g., we somehow
+        // wrap past the IWRAM end).
+        if (is_rom && !r_rom) break;
+        if (is_ram && !r_ram) break;
 
-        // Read straight from the ROM cache. rom_buffer_read_16_fast hits
-        // the last_chunk fast path on consecutive accesses; even on a
-        // miss it goes through the Phase-1 hash table.
-        uint16_t op = rom_buffer_read_16_fast(&rom_buffer, pc);
+        uint16_t op = decode_read_op(pc);
 
         decode_thumb_op(op, &ops[length]);
         ops[length].cycles  = region_ws;
@@ -213,10 +368,9 @@ const thumb_block_t *thumb_block_decode(uint32_t inst_pc) {
 
         pc += 2;
         // Re-read region waitstate when the address crosses into a
-        // different waitstate domain (rare in practice -- ROM regions
-        // 0x08-0x09 / 0x0A-0x0B / 0x0C-0x0D each have their own ws_s_t16
-        // entry). Cheap: an XYRAM load.
-        region_ws = ws_s_t16[(pc >> 25) & 3];
+        // different waitstate domain (rare in practice for ROM; never
+        // for RAM since RAM blocks are page-bounded).
+        if (is_rom) region_ws = ws_s_t16[(pc >> 25) & 3];
     }
 
     if (length == 0) return NULL;
@@ -231,7 +385,8 @@ const thumb_block_t *thumb_block_decode(uint32_t inst_pc) {
     slot->total_cycles = total_cycles;
     slot->ops_offset   = (uint16_t)thumb_uop_pool_head;
     slot->generation   = thumb_block_current_gen;
-    slot->_pad         = 0;
+    slot->page_idx     = page_idx;
+    slot->page_gen     = page_gen;
 
     thumb_uop_pool_head += length;
     return slot;

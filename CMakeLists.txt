@@ -19,6 +19,7 @@ set(SOURCES
   src/gint_gba.c
   src/io.c
   src/rom_buffer.c
+  src/save_file.c
   src/sound.c
   src/thumb_block.c
   src/timer.c
@@ -83,6 +84,16 @@ else()
         "GBA_BUILD must be one of: release | bench | trace (got '${GBA_BUILD}')")
 endif()
 message(STATUS "GBA_BUILD = ${GBA_BUILD}")
+
+# Optional: USB bulk streaming to fxlink for live recording. Adds a
+# non-trivial chunk of gint USB code to the binary and pulls the addin into
+# a usb_open() at startup, so leave it off for normal release builds.
+# Enable with `cmake -DGBA_FXLINK=ON ...` (or `fxsdk build-cg -DGBA_FXLINK=ON`).
+option(GBA_FXLINK "Stream emulator frames to fxlink over USB" OFF)
+if(GBA_FXLINK)
+    target_compile_definitions(myaddin PRIVATE GBA_FXLINK=1)
+endif()
+message(STATUS "GBA_FXLINK = ${GBA_FXLINK}")
 
 # Link-time optimization: lets the linker inline across translation
 # units. Critical here because arm_read() in arm_mem.c calls

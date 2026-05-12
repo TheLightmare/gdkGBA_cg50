@@ -52,13 +52,20 @@ typedef struct thumb_uop_s {
 } thumb_uop_t;
 
 // Cache directory entry. 16 bytes.
+//
+// page_idx + page_gen are used for RAM-resident blocks (IWRAM 0x03,
+// EWRAM 0x02) so write-side invalidation can detect when cached code
+// has been overwritten. page_idx == 0xFFFF means "ROM block, no page
+// check needed" -- ROM is read-only so cached blocks stay valid until
+// the pool wraps (the existing `generation` field handles that).
 typedef struct {
     uint32_t start_pc;       // sentinel 0xFFFFFFFF = empty
     uint16_t length;
     uint16_t total_cycles;
     uint16_t ops_offset;     // index into uop pool
     uint16_t generation;     // matches pool's current_gen, else stale
-    uint16_t _pad;
+    uint16_t page_idx;       // RAM page; 0xFFFF for ROM blocks
+    uint16_t page_gen;       // RAM page gen at decode time (ignored for ROM)
 } thumb_block_t;
 
 // Capacity. Sized so the whole structure fits in ~128 KB extram.
@@ -99,5 +106,14 @@ const thumb_block_t *thumb_block_decode(uint32_t inst_pc);
 static inline uint32_t thumb_block_hash(uint32_t inst_pc) {
     return (inst_pc >> 1) & THUMB_BLOCK_DIR_MASK;
 }
+
+// Bump the page generation for the page containing `addr`. Called from
+// the IWRAM/EWRAM write paths in arm_mem.c so that cached RAM blocks
+// covering this page are detected as stale on next lookup.
+//
+// Cheap: one array index + increment. Safe to call when the cache is
+// disabled (the page-gen array lives in BSS, always allocated). For
+// non-RAM addresses this is a no-op (page index resolves to 0xFFFF).
+void thumb_block_invalidate_page(uint32_t addr);
 
 #endif // THUMB_BLOCK_H

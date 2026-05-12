@@ -7,9 +7,18 @@
 #include "io.h"
 
 #include <gint/display.h>
+#include <gint/kmalloc.h>
+#if GBA_FXLINK
+#include <gint/usb.h>
+#include <gint/usb-ff-bulk.h>
+#endif
+#include "extram.h"
 #include "gint_gba.h"
+#include "video.h"
 
 #include "sound.h"
+
+#include <string.h>
 
 // CG50 screen is 396x224 RGB565; gint_vram is its backing buffer.
 // Center the 240x160 GBA viewport inside it.
@@ -20,6 +29,60 @@
 #define LINE_BYTE_OFFSET(line) \
     (((line) + GBA_Y_OFFSET) * SCREEN_PITCH + GBA_X_OFFSET * 2)
 
+// "Fit to calculator screen" 7/5 upscale state. See video.h for the
+// public contract. Dest region is 336x224 centered horizontally; each
+// dest pixel reads one source pixel via a precomputed nearest-source
+// LUT. The source is backed up to fit_source_backup before the
+// scale-blit overwrites it (the 336x224 dest fully contains the
+// 240x160 source location in gint_vram, so an in-place expansion is
+// not possible without buffering).
+#define FIT_W         336
+#define FIT_H         224
+#define FIT_X_OFFSET  ((CG_SCREEN_W - FIT_W) / 2)  // 30
+
+bool gba_fit_to_screen = false;
+static uint16_t *fit_source_backup = NULL;
+static uint8_t   fit_src_col[FIT_W];   // dest col -> source col 0..239
+static uint8_t   fit_src_row[FIT_H];   // dest row -> source row 0..159
+
+void gba_fit_init(void) {
+    for (int dc = 0; dc < FIT_W; dc++) fit_src_col[dc] = (uint8_t)((dc * 5) / 7);
+    for (int dr = 0; dr < FIT_H; dr++) fit_src_row[dr] = (uint8_t)((dr * 5) / 7);
+
+    if (fit_source_backup) return;
+    // Prefer extram (3 MB arena); fall back to the standard heap if
+    // extram isn't available on this OS. On total allocation failure
+    // gba_fit_to_screen toggles will be no-ops in scale_blit_to_screen.
+    if (extram_available) {
+        fit_source_backup = (uint16_t *)kmalloc(240 * 160 * 2, "extram");
+        if (fit_source_backup) return;
+    }
+    fit_source_backup = (uint16_t *)kmalloc(240 * 160 * 2, "_uram");
+}
+
+static void scale_blit_to_screen(void) {
+    if (!fit_source_backup) return;
+
+    // Snapshot the centered 240x160 source region. Each source row is
+    // 480 bytes contiguous in gint_vram, so memcpy is enough.
+    for (int sy = 0; sy < 160; sy++) {
+        const uint16_t *src = gint_vram
+            + (sy + GBA_Y_OFFSET) * CG_SCREEN_W + GBA_X_OFFSET;
+        memcpy(fit_source_backup + sy * 240, src, 240 * 2);
+    }
+
+    // Scale-blit into the 336x224 region. Pull the source-row pointer
+    // out of the per-pixel loop; per-pixel work is one LUT load and
+    // one indirect read.
+    for (int dr = 0; dr < FIT_H; dr++) {
+        const uint16_t *src_row = fit_source_backup + fit_src_row[dr] * 240;
+        uint16_t *dst_row = gint_vram + dr * CG_SCREEN_W + FIT_X_OFFSET;
+        for (int dc = 0; dc < FIT_W; dc++) {
+            dst_row[dc] = src_row[fit_src_col[dc]];
+        }
+    }
+}
+
 #define LINES_VISIBLE  160
 #define LINES_TOTAL    228
 
@@ -28,6 +91,52 @@
 #define CYC_LINE_HBLK1  (CYC_LINE_TOTAL - CYC_LINE_HBLK0)
 
 void *screen;
+
+#if GBA_FXLINK
+// fxlink frame push, mirroring the canonical pattern from
+// Lephenixnoir/cg-virtual-monitor: sync-write header + body, async-commit
+// with a callback that clears a guard flag. Don't start a new frame until
+// the previous commit has fired its callback. This is the pattern that's
+// known to work for continuous streaming over usb-ff-bulk.
+//
+// Robustness: world switches (rom-buffer chunk loads, save flushes) clobber
+// gint's USB pipe state and cause the host to renumerate. Run fxlink with
+// `-r` so it auto-reconnects through those drops.
+static volatile int fxlink_commit_pending = 0;
+static int fxlink_skip = 0;
+
+static usb_fxlink_header_t fxlink_hdr;
+static usb_fxlink_image_t  fxlink_subhdr;
+
+static void fxlink_commit_done(void) { fxlink_commit_pending = 0; }
+
+static void fxlink_try_push_frame(void) {
+    if (!usb_is_open()) {
+        fxlink_commit_pending = 0;
+        return;
+    }
+    if (fxlink_commit_pending) return;
+    if (++fxlink_skip < 3) return;
+    fxlink_skip = 0;
+
+    int size = DWIDTH * DHEIGHT * 2;  // RGB565
+    usb_fxlink_fill_header(&fxlink_hdr, "fxlink", "video",
+                           size + sizeof fxlink_subhdr);
+    fxlink_subhdr.width        = htole32(DWIDTH);
+    fxlink_subhdr.height       = htole32(DHEIGHT);
+    fxlink_subhdr.pixel_format = htole32(USB_FXLINK_IMAGE_RGB565);
+
+    int pipe = usb_ff_bulk_output();
+    fxlink_commit_pending = 1;
+    usb_write_sync(pipe, &fxlink_hdr,    sizeof fxlink_hdr,    false);
+    usb_write_sync(pipe, &fxlink_subhdr, sizeof fxlink_subhdr, false);
+    usb_write_sync(pipe, gint_vram,      size,                 false);
+    if (usb_commit_async(pipe, GINT_CALL(fxlink_commit_done)) != 0) {
+        // Commit couldn't queue; force-clear so future frames can try.
+        fxlink_commit_pending = 0;
+    }
+}
+#endif // GBA_FXLINK
 
 static const uint8_t x_tiles_lut[16] = { 1, 2, 4, 8, 2, 4, 4, 8, 1, 1, 2, 4, 0, 0, 0, 0 };
 static const uint8_t y_tiles_lut[16] = { 1, 2, 4, 8, 1, 1, 2, 4, 2, 4, 4, 8, 0, 0, 0, 0 };
@@ -877,7 +986,7 @@ static void vcount_match() {
 //   FRAMESKIP=1: render every other
 //   FRAMESKIP=2: render 1 in 3
 #ifndef FRAMESKIP
-#define FRAMESKIP 0
+#define FRAMESKIP 1
 #endif
 
 void run_frame() {
@@ -1038,8 +1147,22 @@ void run_frame() {
     }
 #endif // GBA_DEBUG_OVERLAY
 
+    // Fit-to-screen post-process. The rasterisers still wrote the GBA
+    // frame to the centered 240x160 region; this expands it 7/5 to a
+    // 336x224 region centered horizontally. Costs a 76 KB backup +
+    // 150 KB stretched write per frame; only paid when the user has
+    // opted in.
+    if (gba_fit_to_screen) scale_blit_to_screen();
+
     // gint_vram is the active framebuffer; just push it to the display.
     BENCH_TIME_BLOCK(bench_dupdate_ticks, dupdate());
+
+#if GBA_FXLINK
+    // Push the just-displayed frame to fxlink for live streaming on the
+    // host. Builds without -DGBA_FXLINK=ON skip the call entirely (no
+    // USB code linked).
+    fxlink_try_push_frame();
+#endif
 
     // sound_buffer_wrap();   // see note above on sound_clock()
 }
