@@ -14,6 +14,7 @@ set(SOURCES
   src/arm_mem.c
   src/arm.c
   src/bench.c
+  src/code_block.c
   src/dma.c
   src/extram.c
   src/gint_gba.c

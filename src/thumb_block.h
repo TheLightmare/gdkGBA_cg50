@@ -107,13 +107,8 @@ static inline uint32_t thumb_block_hash(uint32_t inst_pc) {
     return (inst_pc >> 1) & THUMB_BLOCK_DIR_MASK;
 }
 
-// Bump the page generation for the page containing `addr`. Called from
-// the IWRAM/EWRAM write paths in arm_mem.c so that cached RAM blocks
-// covering this page are detected as stale on next lookup.
-//
-// Cheap: one array index + increment. Safe to call when the cache is
-// disabled (the page-gen array lives in BSS, always allocated). For
-// non-RAM addresses this is a no-op (page index resolves to 0xFFFF).
-void thumb_block_invalidate_page(uint32_t addr);
+// Page-invalidation is in code_block.h's code_block_invalidate_page --
+// shared with the ARM block cache so a single RAM write bumps the
+// freshness counters seen by both.
 
 #endif // THUMB_BLOCK_H

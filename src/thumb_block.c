@@ -6,6 +6,7 @@
 #include <gint/kmalloc.h>
 
 #include "arm_mem.h"      // rom_buffer, wram_chip, wram_board, ewram_mask
+#include "code_block.h"   // code_page_gen, code_page_idx, CODE_PAGE_* constants
 #include "extram.h"
 #include "io.h"           // ws_s_t16
 #include "mem_swizzle.h"
@@ -17,49 +18,10 @@ thumb_uop_t   *thumb_uop_pool    = NULL;
 uint16_t       thumb_block_current_gen = 1;
 static uint32_t thumb_uop_pool_head = 0;
 
-// Page-generation tracking for RAM-resident blocks.
-//
-// A "page" is 256 bytes. Pages 0..127 cover IWRAM (32 KB), pages
-// 128..1151 cover EWRAM (256 KB max). The arm_mem.c write paths bump
-// the gen for the page they wrote into; cached RAM blocks store the
-// page gen they saw at decode time, and the lookup compares it
-// against the current gen to detect overwrites.
-//
-// uint16_t means a page can be written 65535 times before the gen
-// counter wraps. After wrap, a stale block whose stored gen happens
-// to match the current gen would falsely pass the freshness check
-// (cart misbehaves until the block is naturally evicted by pool
-// rotation -- not a correctness issue per se but worth knowing).
-#define THUMB_PAGE_BITS    8u
-#define THUMB_PAGE_SIZE    (1u << THUMB_PAGE_BITS)
-#define THUMB_PAGE_MASK    (THUMB_PAGE_SIZE - 1u)
-#define THUMB_IWRAM_PAGES  (0x8000u / THUMB_PAGE_SIZE)        // 128
-#define THUMB_EWRAM_PAGES  (0x40000u / THUMB_PAGE_SIZE)       // 1024
-#define THUMB_TOTAL_PAGES  (THUMB_IWRAM_PAGES + THUMB_EWRAM_PAGES)
-#define THUMB_PAGE_NONE    0xFFFFu
-
-static uint16_t thumb_page_gen[THUMB_TOTAL_PAGES];
-
-// Map a guest address to its page index in thumb_page_gen, or
-// THUMB_PAGE_NONE for non-RAM regions.
-static inline uint16_t ram_page_idx(uint32_t addr) {
-    uint8_t reg = (addr >> 24) & 0xFu;
-    if (reg == 0x03) {
-        return (uint16_t)((addr & 0x7FFFu) >> THUMB_PAGE_BITS);
-    }
-    if (reg == 0x02) {
-        return (uint16_t)(THUMB_IWRAM_PAGES +
-                          ((addr & ewram_mask) >> THUMB_PAGE_BITS));
-    }
-    return THUMB_PAGE_NONE;
-}
-
-void thumb_block_invalidate_page(uint32_t addr) {
-    uint16_t idx = ram_page_idx(addr);
-    if (idx != THUMB_PAGE_NONE) {
-        thumb_page_gen[idx]++;
-    }
-}
+// Page-generation tracking lives in code_block.{h,c}: shared across the
+// Thumb and ARM caches so a RAM write invalidates both regardless of
+// which mode produced the cached block. See code_block.h for the
+// page-size / index conventions used by the lookup/decode below.
 
 // thumb_proc[] is defined in arm.c. The Phase 4b legacy fallback
 // handler dispatches through it for opcodes without a specialised
@@ -243,14 +205,14 @@ bool thumb_block_init(void) {
         thumb_block_dir[i].total_cycles = 0;
         thumb_block_dir[i].ops_offset   = 0;
         thumb_block_dir[i].generation   = 0;
-        thumb_block_dir[i].page_idx     = THUMB_PAGE_NONE;
+        thumb_block_dir[i].page_idx     = CODE_PAGE_NONE;
         thumb_block_dir[i].page_gen     = 0;
     }
 
     // Reset all page generations. Static BSS already zero, but be
     // explicit -- we'll bump these on every RAM write.
-    for (uint32_t i = 0; i < THUMB_TOTAL_PAGES; i++) {
-        thumb_page_gen[i] = 0;
+    for (uint32_t i = 0; i < CODE_TOTAL_PAGES; i++) {
+        code_page_gen[i] = 0;
     }
 
     thumb_uop_pool_head      = 0;
@@ -277,10 +239,10 @@ const thumb_block_t *thumb_block_lookup(uint32_t inst_pc) {
     if (b->generation != thumb_block_current_gen) return NULL;
 
     // For RAM blocks, also confirm the page hasn't been written to since
-    // we decoded. ROM blocks have page_idx == THUMB_PAGE_NONE and skip
+    // we decoded. ROM blocks have page_idx == CODE_PAGE_NONE and skip
     // this check.
-    if (b->page_idx != THUMB_PAGE_NONE) {
-        if (thumb_page_gen[b->page_idx] != b->page_gen) return NULL;
+    if (b->page_idx != CODE_PAGE_NONE) {
+        if (code_page_gen[b->page_idx] != b->page_gen) return NULL;
     }
 
     return b;
@@ -313,14 +275,14 @@ const thumb_block_t *thumb_block_decode(uint32_t inst_pc) {
     // the lookup-side freshness check has something to compare. The
     // block decoder also caps the block at the next 256-byte page
     // boundary so we never need to track per-page state for >1 page.
-    uint16_t page_idx = THUMB_PAGE_NONE;
+    uint16_t page_idx = CODE_PAGE_NONE;
     uint16_t page_gen = 0;
     uint32_t page_end_pc = 0xFFFFFFFFu;
     if (is_ram) {
-        page_idx = ram_page_idx(inst_pc);
-        if (page_idx == THUMB_PAGE_NONE) return NULL;  // shouldn't hit
-        page_gen = thumb_page_gen[page_idx];
-        page_end_pc = (inst_pc | THUMB_PAGE_MASK) + 1u;
+        page_idx = code_page_idx(inst_pc);
+        if (page_idx == CODE_PAGE_NONE) return NULL;  // shouldn't hit
+        page_gen = code_page_gen[page_idx];
+        page_end_pc = (inst_pc | CODE_PAGE_MASK) + 1u;
     }
 
     // Reserve pool space. If we'd exceed the pool, wrap the head and bump

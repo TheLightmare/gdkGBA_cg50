@@ -5,6 +5,7 @@
 #include "arm_mem.h"
 #include "bench.h"
 #include "build_flags.h"
+#include "code_block.h"
 #include "io.h"
 #include "mem_swizzle.h"
 #include "rom_buffer.h"
@@ -716,12 +717,12 @@ void arm_writeb(uint32_t address, uint8_t value) {
     // covering this page is detected as stale on the next lookup.
     if (ah == 0x03) {
         mem_swz_write_b(wram_chip, address & 0x7FFF, value);
-        thumb_block_invalidate_page(address);
+        code_block_invalidate_page(address);
         return;
     }
     if (ah == 0x02) {
         mem_swz_write_b(wram_board, address & ewram_mask, value);
-        thumb_block_invalidate_page(address);
+        code_block_invalidate_page(address);
         return;
     }
     // Other page-table regions (only OAM remains writable through here,
@@ -763,12 +764,12 @@ void arm_writeh(uint32_t address, uint16_t value) {
     // Thumb block covering this page.
     if (ah == 0x03) {
         mem_swz_write_h(wram_chip, a & 0x7FFF, value);
-        thumb_block_invalidate_page(a);
+        code_block_invalidate_page(a);
         return;
     }
     if (ah == 0x02) {
         mem_swz_write_h(wram_board, a & ewram_mask, value);
-        thumb_block_invalidate_page(a);
+        code_block_invalidate_page(a);
         return;
     }
     // Other page-table regions (OAM keeps the byte-store path).
@@ -818,12 +819,12 @@ void arm_write(uint32_t address, uint32_t value) {
     // block covering this page.
     if (ah == 0x03) {
         mem_swz_write_w(wram_chip, a & 0x7FFF, value);
-        thumb_block_invalidate_page(a);
+        code_block_invalidate_page(a);
         return;
     }
     if (ah == 0x02) {
         mem_swz_write_w(wram_board, a & ewram_mask, value);
-        thumb_block_invalidate_page(a);
+        code_block_invalidate_page(a);
         return;
     }
     // Other page-table regions (OAM keeps the byte-store path).

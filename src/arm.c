@@ -8,6 +8,7 @@
 #include "arm_shared.h"
 #include "bench.h"
 #include "build_flags.h"
+#include "code_block.h"
 #include "mem_swizzle.h"
 #include "thumb_block.h"
 
@@ -3037,13 +3038,13 @@ static void hle_register_ram_reset(void) {
         // Phase 4c: raw memset bypasses arm_write*, so invalidate any
         // cached Thumb blocks covering this region directly.
         for (uint32_t a = 0; a < ewram_size; a += 256) {
-            thumb_block_invalidate_page(0x02000000u + a);
+            code_block_invalidate_page(0x02000000u + a);
         }
     }
     if (flags & 0x02) {
         memset(wram_chip, 0, sizeof(wram_chip) - 0x200);
         for (uint32_t a = 0; a < sizeof(wram_chip) - 0x200; a += 256) {
-            thumb_block_invalidate_page(0x03000000u + a);
+            code_block_invalidate_page(0x03000000u + a);
         }
     }
     if (flags & 0x04) memset(palette_ram, 0, sizeof(palette_ram));
