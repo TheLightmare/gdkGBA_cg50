@@ -6,6 +6,7 @@
 #include "arm.h"
 #include "arm_mem.h"
 #include "arm_shared.h"
+#include "bench.h"
 #include "build_flags.h"
 #include "mem_swizzle.h"
 #include "thumb_block.h"
@@ -4071,7 +4072,18 @@ volatile uint8_t  arm_swi_last;
 // gint_set_onchip_save_mode(BACKUP) in main.c covers the entire ILRAM
 // region across world switches, so chunk-load fread can still happen
 // without trashing the dispatch code.
-#define ILRAM_CODE __attribute__((section(".gint.mapped")))
+// Bench/trace instrumentation pushes arm_exec past the 4 KB ILRAM budget
+// (TMU reads for the Thumb/ARM inner-loop phase timers + extra counters
+// add ~100 bytes; the pre-existing PC-trace overhead in trace builds adds
+// more). Diagnostics are about ratios, not absolute speed, so drop the
+// ILRAM pinning when GBA_BENCH is on -- arm_exec then lives in normal
+// .text and goes through the regular I-cache like the rest of the
+// emulator's hot paths.
+#if GBA_BENCH
+#  define ILRAM_CODE
+#else
+#  define ILRAM_CODE __attribute__((section(".gint.mapped")))
+#endif
 void arm_exec(uint32_t target_cycles) ILRAM_CODE;
 void arm_exec(uint32_t target_cycles) {
     if (int_halt) {
@@ -4102,6 +4114,9 @@ void arm_exec(uint32_t target_cycles) {
     // overwhelming common case in any game's hot loop).
     while (arm_cycles < target_cycles) {
         if (arm_in_thumb()) {
+#if GBA_BENCH
+            uint32_t _bench_thumb_t0 = bench_now();
+#endif
             do {
                 // Block-cache fast path. arm_r.r[15] holds the prefetched
                 // PC (instruction PC + 4 in Thumb), so the actual
@@ -4111,7 +4126,11 @@ void arm_exec(uint32_t target_cycles) {
                 {
                     uint32_t inst_pc = arm_r.r[15] - 4u;
                     const thumb_block_t *b = thumb_block_lookup(inst_pc);
-                    if (!b) b = thumb_block_decode(inst_pc);
+                    if (b) {
+                        BENCH_INC(bench_thumb_block_hit);
+                    } else if ((b = thumb_block_decode(inst_pc)) != NULL) {
+                        BENCH_INC(bench_thumb_block_decode);
+                    }
                     if (b) {
                         const thumb_uop_t *ops =
                             thumb_uop_pool + b->ops_offset;
@@ -4155,6 +4174,9 @@ void arm_exec(uint32_t target_cycles) {
                         pipe_reload = false;
                         if (int_halt) {
                             arm_cycles = target_cycles;
+#if GBA_BENCH
+                            bench_thumb_inner_ticks += bench_elapsed(_bench_thumb_t0);
+#endif
                             goto done;
                         }
                         continue;
@@ -4164,6 +4186,7 @@ void arm_exec(uint32_t target_cycles) {
                 // Single-step fallback (RAM-resident Thumb, ROM Thumb
                 // when the cache is disabled, or any case the block
                 // path declined).
+                BENCH_INC(bench_thumb_single_step);
                 arm_op      = arm_pipe[0];
                 arm_pipe[0] = arm_pipe[1];
 
@@ -4178,10 +4201,19 @@ void arm_exec(uint32_t target_cycles) {
 
                 if (int_halt) {
                     arm_cycles = target_cycles;
+#if GBA_BENCH
+                    bench_thumb_inner_ticks += bench_elapsed(_bench_thumb_t0);
+#endif
                     goto done;
                 }
             } while (arm_cycles < target_cycles && arm_in_thumb());
+#if GBA_BENCH
+            bench_thumb_inner_ticks += bench_elapsed(_bench_thumb_t0);
+#endif
         } else {
+#if GBA_BENCH
+            uint32_t _bench_arm_t0 = bench_now();
+#endif
             do {
                 arm_op      = arm_pipe[0];
                 arm_pipe[0] = arm_pipe[1];
@@ -4197,9 +4229,15 @@ void arm_exec(uint32_t target_cycles) {
 
                 if (int_halt) {
                     arm_cycles = target_cycles;
+#if GBA_BENCH
+                    bench_arm_inner_ticks += bench_elapsed(_bench_arm_t0);
+#endif
                     goto done;
                 }
             } while (arm_cycles < target_cycles && !arm_in_thumb());
+#if GBA_BENCH
+            bench_arm_inner_ticks += bench_elapsed(_bench_arm_t0);
+#endif
         }
     }
 done:

@@ -31,6 +31,15 @@ extern uint64_t bench_arm_exec_ticks;
 extern uint64_t bench_render_ticks;
 extern uint64_t bench_dupdate_ticks;
 
+// Inner-dispatch phase ticks. arm_exec splits into a Thumb inner do-while
+// and an ARM inner do-while; these accumulate the wall time spent inside
+// each. Their sum is slightly less than bench_arm_exec_ticks (excludes
+// the outer while, timer batching, and the dispatcher prologue/epilogue),
+// but the split is what reveals whether Thumb or ARM dominates the hot
+// path -- needed to decide whether ARM-mode block caching is worth doing.
+extern uint64_t bench_thumb_inner_ticks;
+extern uint64_t bench_arm_inner_ticks;
+
 // Last frame's measured wall time (microseconds). Updated each frame in
 // main.c so the heartbeat overlay can display "what the bench thinks the
 // fps is" alongside the user's visual perception.
@@ -45,6 +54,20 @@ extern uint32_t bench_freq_hz;
 extern uint32_t bench_mem_slow_read;
 extern uint32_t bench_mem_slow_write;
 extern uint32_t bench_chunk_miss;
+
+// Thumb block-cache outcome counters. Incremented at the dispatch site in
+// arm_exec, one per Thumb-mode iteration of the outer loop:
+//   hit          -- thumb_block_lookup returned a live block.
+//   decode       -- lookup missed; thumb_block_decode produced a fresh block.
+//   single_step  -- neither path produced a block (RAM with stale page-gen
+//                   that decoded to nothing, non-ROM/non-RAM region, or
+//                   cache disabled). Falls back to t16_step.
+// Ratio hit / (hit + decode + single_step) is the block-cache hit rate;
+// decode / total is cold-block pressure. Both inform whether to invest in
+// block chaining or a bigger uop pool.
+extern uint32_t bench_thumb_block_hit;
+extern uint32_t bench_thumb_block_decode;
+extern uint32_t bench_thumb_single_step;
 
 #else  // !GBA_BENCH
 

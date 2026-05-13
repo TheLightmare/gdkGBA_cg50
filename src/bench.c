@@ -10,6 +10,9 @@ uint64_t bench_arm_exec_ticks;
 uint64_t bench_render_ticks;
 uint64_t bench_dupdate_ticks;
 
+uint64_t bench_thumb_inner_ticks;
+uint64_t bench_arm_inner_ticks;
+
 uint32_t bench_last_frame_us;
 
 uint32_t bench_freq_hz;
@@ -17,6 +20,10 @@ uint32_t bench_freq_hz;
 uint32_t bench_mem_slow_read;
 uint32_t bench_mem_slow_write;
 uint32_t bench_chunk_miss;
+
+uint32_t bench_thumb_block_hit;
+uint32_t bench_thumb_block_decode;
+uint32_t bench_thumb_single_step;
 
 static int bench_tmu_id = -1;
 static uint32_t bench_tcor;

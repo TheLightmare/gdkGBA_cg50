@@ -435,9 +435,14 @@ int main(void) {
         uint64_t arm_at_start = bench_arm_exec_ticks;
         uint64_t ren_at_start = bench_render_ticks;
         uint64_t dup_at_start = bench_dupdate_ticks;
+        uint64_t ti_at_start  = bench_thumb_inner_ticks;
+        uint64_t ai_at_start  = bench_arm_inner_ticks;
         uint32_t slr_at_start = bench_mem_slow_read;
         uint32_t slw_at_start = bench_mem_slow_write;
         uint32_t cm_at_start  = bench_chunk_miss;
+        uint32_t tbh_at_start = bench_thumb_block_hit;
+        uint32_t tbd_at_start = bench_thumb_block_decode;
+        uint32_t tss_at_start = bench_thumb_single_step;
 #endif
 
         run_frame();
@@ -547,7 +552,12 @@ int main(void) {
         bool is_manual = capture_now_pending && !is_scheduled && !is_spike;
         capture_now_pending = false;
         if (is_scheduled || is_spike || is_manual) {
-            char buf[1280];
+            // Static -- the snapshot block is non-reentrant and the buffer
+            // is only used here. Moves 1.6 KB off main()'s stack; gint's
+            // main stack is small enough that this much extra pressure on
+            // a deep call path can reboot the calculator (observed once
+            // around frame 2400 in a Minish Cap session before this).
+            static char buf[1600];
             int n = 0;
             arm_flags_to_cpsr();
             if (is_spike) {
@@ -678,17 +688,36 @@ int main(void) {
             uint32_t fd_us = bench_freq_hz
                 ? (uint32_t)(((bench_dupdate_ticks - dup_at_start) * 1000000ULL) / bench_freq_hz)
                 : 0;
+            uint32_t fti_us = bench_freq_hz
+                ? (uint32_t)(((bench_thumb_inner_ticks - ti_at_start) * 1000000ULL) / bench_freq_hz)
+                : 0;
+            uint32_t fai_us = bench_freq_hz
+                ? (uint32_t)(((bench_arm_inner_ticks - ai_at_start) * 1000000ULL) / bench_freq_hz)
+                : 0;
             uint32_t fslr = bench_mem_slow_read  - slr_at_start;
             uint32_t fslw = bench_mem_slow_write - slw_at_start;
             uint32_t fcm  = bench_chunk_miss     - cm_at_start;
+            uint32_t ftbh = bench_thumb_block_hit    - tbh_at_start;
+            uint32_t ftbd = bench_thumb_block_decode - tbd_at_start;
+            uint32_t ftss = bench_thumb_single_step  - tss_at_start;
+            // Hit rate over (hit + decode + single_step). Reported as
+            // permille so integer math survives without losing the
+            // resolution needed to distinguish 98% from 99.5%.
+            uint32_t ftbt = ftbh + ftbd + ftss;
+            uint32_t fhit_pm = ftbt ? (uint32_t)(((uint64_t)ftbh * 1000ULL) / ftbt) : 0;
             n += snprintf(buf + n, sizeof(buf) - n,
                 "FRAME breakdown:\n"
                 "  arm_exec=%lu us  render=%lu us  dupdate=%lu us\n"
-                "  slow_read=%lu  slow_write=%lu  chunk_miss=%lu\n",
+                "  thumb_inner=%lu us  arm_inner=%lu us\n"
+                "  slow_read=%lu  slow_write=%lu  chunk_miss=%lu\n"
+                "  block hit=%lu decode=%lu single=%lu  hit_rate=%lu.%lu%%\n",
                 (unsigned long)fa_us, (unsigned long)fr_us,
                 (unsigned long)fd_us,
+                (unsigned long)fti_us, (unsigned long)fai_us,
                 (unsigned long)fslr, (unsigned long)fslw,
-                (unsigned long)fcm);
+                (unsigned long)fcm,
+                (unsigned long)ftbh, (unsigned long)ftbd, (unsigned long)ftss,
+                (unsigned long)(fhit_pm / 10), (unsigned long)(fhit_pm % 10));
 
             // Cumulative-since-prev-scheduled-snapshot — only meaningful and
             // only reset on scheduled snapshots. Spike snapshots leave the
@@ -709,27 +738,57 @@ int main(void) {
                 uint32_t dup_us = bench_freq_hz
                     ? (uint32_t)((bench_dupdate_ticks * 1000000ULL) / bench_freq_hz)
                     : 0;
+                uint32_t ti_us = bench_freq_hz
+                    ? (uint32_t)((bench_thumb_inner_ticks * 1000000ULL) / bench_freq_hz)
+                    : 0;
+                uint32_t ai_us = bench_freq_hz
+                    ? (uint32_t)((bench_arm_inner_ticks * 1000000ULL) / bench_freq_hz)
+                    : 0;
+                uint32_t inner_total = ti_us + ai_us;
+                uint32_t thumb_share_pm = inner_total
+                    ? (uint32_t)(((uint64_t)ti_us * 1000ULL) / inner_total)
+                    : 0;
+                uint32_t tb_total = bench_thumb_block_hit
+                                  + bench_thumb_block_decode
+                                  + bench_thumb_single_step;
+                uint32_t hit_pm = tb_total
+                    ? (uint32_t)(((uint64_t)bench_thumb_block_hit * 1000ULL) / tb_total)
+                    : 0;
                 n += snprintf(buf + n, sizeof(buf) - n,
                     "BENCH (totals over %lu frames, freq=%lu Hz):\n"
                     "  arm_exec=%lu us (%lu/frame)\n"
                     "  render  =%lu us (%lu/frame)\n"
                     "  dupdate =%lu us (%lu/frame)\n"
+                    "  thumb_inner=%lu us  arm_inner=%lu us  thumb_share=%lu.%lu%%\n"
+                    "  block hit=%lu decode=%lu single=%lu  hit_rate=%lu.%lu%%\n"
                     "  slow_read=%lu  slow_write=%lu  chunk_miss=%lu\n",
                     (unsigned long)frames_in_span,
                     (unsigned long)bench_freq_hz,
                     (unsigned long)arm_us, (unsigned long)(arm_us / frames_in_span),
                     (unsigned long)ren_us, (unsigned long)(ren_us / frames_in_span),
                     (unsigned long)dup_us, (unsigned long)(dup_us / frames_in_span),
+                    (unsigned long)ti_us, (unsigned long)ai_us,
+                    (unsigned long)(thumb_share_pm / 10),
+                    (unsigned long)(thumb_share_pm % 10),
+                    (unsigned long)bench_thumb_block_hit,
+                    (unsigned long)bench_thumb_block_decode,
+                    (unsigned long)bench_thumb_single_step,
+                    (unsigned long)(hit_pm / 10), (unsigned long)(hit_pm % 10),
                     (unsigned long)bench_mem_slow_read,
                     (unsigned long)bench_mem_slow_write,
                     (unsigned long)bench_chunk_miss);
                 // Reset cumulative for next interval.
-                bench_arm_exec_ticks  = 0;
-                bench_render_ticks    = 0;
-                bench_dupdate_ticks   = 0;
-                bench_mem_slow_read   = 0;
-                bench_mem_slow_write  = 0;
-                bench_chunk_miss      = 0;
+                bench_arm_exec_ticks     = 0;
+                bench_render_ticks       = 0;
+                bench_dupdate_ticks      = 0;
+                bench_thumb_inner_ticks  = 0;
+                bench_arm_inner_ticks    = 0;
+                bench_mem_slow_read      = 0;
+                bench_mem_slow_write     = 0;
+                bench_chunk_miss         = 0;
+                bench_thumb_block_hit    = 0;
+                bench_thumb_block_decode = 0;
+                bench_thumb_single_step  = 0;
             }
             n += snprintf(buf + n, sizeof(buf) - n, "\n");
 
