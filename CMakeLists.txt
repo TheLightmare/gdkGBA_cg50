@@ -13,6 +13,7 @@ set(SOURCES
   src/main.c
   src/arm_mem.c
   src/arm.c
+  src/arm_block.c
   src/bench.c
   src/code_block.c
   src/dma.c

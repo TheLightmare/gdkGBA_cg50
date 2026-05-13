@@ -69,6 +69,16 @@ extern uint32_t bench_thumb_block_hit;
 extern uint32_t bench_thumb_block_decode;
 extern uint32_t bench_thumb_single_step;
 
+// ARM block-cache outcome counters. Same semantics as the Thumb trio
+// above, for the ARM dispatch site. Until the ARM block cache is wired
+// into arm_exec (later step on the arm-block-cache branch) the dispatch
+// site falls through to single_step every iteration, so initial traces
+// will show 100% single_step and zero hits/decodes -- that's the
+// expected baseline against which the executor's effect is measured.
+extern uint32_t bench_arm_block_hit;
+extern uint32_t bench_arm_block_decode;
+extern uint32_t bench_arm_single_step;
+
 #else  // !GBA_BENCH
 
 // Release builds: bench is fully compiled out. Provide an inline no-op

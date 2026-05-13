@@ -25,6 +25,10 @@ uint32_t bench_thumb_block_hit;
 uint32_t bench_thumb_block_decode;
 uint32_t bench_thumb_single_step;
 
+uint32_t bench_arm_block_hit;
+uint32_t bench_arm_block_decode;
+uint32_t bench_arm_single_step;
+
 static int bench_tmu_id = -1;
 static uint32_t bench_tcor;
 

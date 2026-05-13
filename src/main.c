@@ -18,6 +18,7 @@
 #include <stdlib.h>
 
 #include "arm.h"
+#include "arm_block.h"
 #include "arm_mem.h"
 #include "bench.h"
 #include "build_flags.h"
@@ -115,6 +116,12 @@ int main(void) {
     // Allocate the Thumb block cache. Failure is not fatal -- the
     // interpreter runs unchanged when thumb_block_enabled stays false.
     thumb_block_init();
+
+    // Allocate the ARM block cache. Skeleton-only at this stage:
+    // structures exist but arm_block_enabled stays false until the
+    // executor + dispatcher integration lands. Failure is silent --
+    // the ARM single-step interpreter runs unchanged either way.
+    arm_block_init();
 
     // Allocate the fit-to-screen source backup buffer (76 KB, prefers
     // extram). Failure is silent; fit mode just stays a no-op.
@@ -443,6 +450,9 @@ int main(void) {
         uint32_t tbh_at_start = bench_thumb_block_hit;
         uint32_t tbd_at_start = bench_thumb_block_decode;
         uint32_t tss_at_start = bench_thumb_single_step;
+        uint32_t abh_at_start = bench_arm_block_hit;
+        uint32_t abd_at_start = bench_arm_block_decode;
+        uint32_t ass_at_start = bench_arm_single_step;
 #endif
 
         run_frame();
@@ -557,7 +567,7 @@ int main(void) {
             // main stack is small enough that this much extra pressure on
             // a deep call path can reboot the calculator (observed once
             // around frame 2400 in a Minish Cap session before this).
-            static char buf[1600];
+            static char buf[1800];
             int n = 0;
             arm_flags_to_cpsr();
             if (is_spike) {
@@ -700,24 +710,32 @@ int main(void) {
             uint32_t ftbh = bench_thumb_block_hit    - tbh_at_start;
             uint32_t ftbd = bench_thumb_block_decode - tbd_at_start;
             uint32_t ftss = bench_thumb_single_step  - tss_at_start;
+            uint32_t fabh = bench_arm_block_hit      - abh_at_start;
+            uint32_t fabd = bench_arm_block_decode   - abd_at_start;
+            uint32_t fass = bench_arm_single_step    - ass_at_start;
             // Hit rate over (hit + decode + single_step). Reported as
             // permille so integer math survives without losing the
             // resolution needed to distinguish 98% from 99.5%.
             uint32_t ftbt = ftbh + ftbd + ftss;
             uint32_t fhit_pm = ftbt ? (uint32_t)(((uint64_t)ftbh * 1000ULL) / ftbt) : 0;
+            uint32_t fabt = fabh + fabd + fass;
+            uint32_t fahit_pm = fabt ? (uint32_t)(((uint64_t)fabh * 1000ULL) / fabt) : 0;
             n += snprintf(buf + n, sizeof(buf) - n,
                 "FRAME breakdown:\n"
                 "  arm_exec=%lu us  render=%lu us  dupdate=%lu us\n"
                 "  thumb_inner=%lu us  arm_inner=%lu us\n"
                 "  slow_read=%lu  slow_write=%lu  chunk_miss=%lu\n"
-                "  block hit=%lu decode=%lu single=%lu  hit_rate=%lu.%lu%%\n",
+                "  thumb block hit=%lu decode=%lu single=%lu  hit_rate=%lu.%lu%%\n"
+                "  arm   block hit=%lu decode=%lu single=%lu  hit_rate=%lu.%lu%%\n",
                 (unsigned long)fa_us, (unsigned long)fr_us,
                 (unsigned long)fd_us,
                 (unsigned long)fti_us, (unsigned long)fai_us,
                 (unsigned long)fslr, (unsigned long)fslw,
                 (unsigned long)fcm,
                 (unsigned long)ftbh, (unsigned long)ftbd, (unsigned long)ftss,
-                (unsigned long)(fhit_pm / 10), (unsigned long)(fhit_pm % 10));
+                (unsigned long)(fhit_pm / 10), (unsigned long)(fhit_pm % 10),
+                (unsigned long)fabh, (unsigned long)fabd, (unsigned long)fass,
+                (unsigned long)(fahit_pm / 10), (unsigned long)(fahit_pm % 10));
 
             // Cumulative-since-prev-scheduled-snapshot — only meaningful and
             // only reset on scheduled snapshots. Spike snapshots leave the
@@ -754,13 +772,20 @@ int main(void) {
                 uint32_t hit_pm = tb_total
                     ? (uint32_t)(((uint64_t)bench_thumb_block_hit * 1000ULL) / tb_total)
                     : 0;
+                uint32_t ab_total = bench_arm_block_hit
+                                  + bench_arm_block_decode
+                                  + bench_arm_single_step;
+                uint32_t ahit_pm = ab_total
+                    ? (uint32_t)(((uint64_t)bench_arm_block_hit * 1000ULL) / ab_total)
+                    : 0;
                 n += snprintf(buf + n, sizeof(buf) - n,
                     "BENCH (totals over %lu frames, freq=%lu Hz):\n"
                     "  arm_exec=%lu us (%lu/frame)\n"
                     "  render  =%lu us (%lu/frame)\n"
                     "  dupdate =%lu us (%lu/frame)\n"
                     "  thumb_inner=%lu us  arm_inner=%lu us  thumb_share=%lu.%lu%%\n"
-                    "  block hit=%lu decode=%lu single=%lu  hit_rate=%lu.%lu%%\n"
+                    "  thumb block hit=%lu decode=%lu single=%lu  hit_rate=%lu.%lu%%\n"
+                    "  arm   block hit=%lu decode=%lu single=%lu  hit_rate=%lu.%lu%%\n"
                     "  slow_read=%lu  slow_write=%lu  chunk_miss=%lu\n",
                     (unsigned long)frames_in_span,
                     (unsigned long)bench_freq_hz,
@@ -774,6 +799,10 @@ int main(void) {
                     (unsigned long)bench_thumb_block_decode,
                     (unsigned long)bench_thumb_single_step,
                     (unsigned long)(hit_pm / 10), (unsigned long)(hit_pm % 10),
+                    (unsigned long)bench_arm_block_hit,
+                    (unsigned long)bench_arm_block_decode,
+                    (unsigned long)bench_arm_single_step,
+                    (unsigned long)(ahit_pm / 10), (unsigned long)(ahit_pm % 10),
                     (unsigned long)bench_mem_slow_read,
                     (unsigned long)bench_mem_slow_write,
                     (unsigned long)bench_chunk_miss);
@@ -789,6 +818,9 @@ int main(void) {
                 bench_thumb_block_hit    = 0;
                 bench_thumb_block_decode = 0;
                 bench_thumb_single_step  = 0;
+                bench_arm_block_hit      = 0;
+                bench_arm_block_decode   = 0;
+                bench_arm_single_step    = 0;
             }
             n += snprintf(buf + n, sizeof(buf) - n, "\n");
 
@@ -817,6 +849,7 @@ int main(void) {
     // Clean up ROM buffer resources
     rom_buffer_cleanup(&rom_buffer);
     thumb_block_uninit();
+    arm_block_uninit();
 
     gint_gba_uninit();
     arm_uninit();
