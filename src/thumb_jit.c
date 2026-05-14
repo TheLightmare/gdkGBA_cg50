@@ -47,16 +47,17 @@ extern uint32_t arm_flag_z;
 
 extern bool int_halt;
 
-extern void t16_dec_mov_imm8(const thumb_uop_t *uop);
-extern void t16_dec_b_imm11(const thumb_uop_t *uop);
-extern void t16_dec_b_cond (const thumb_uop_t *uop);
-extern void t16_dec_ldr_imm5 (const thumb_uop_t *uop);
-extern void t16_dec_str_imm5 (const thumb_uop_t *uop);
-extern void t16_dec_ldr_pc8  (const thumb_uop_t *uop);
-extern void t16_dec_ldrb_imm5(const thumb_uop_t *uop);
-extern void t16_dec_strb_imm5(const thumb_uop_t *uop);
+extern void t16_dec_mov_imm8   (const thumb_uop_t *uop);
+extern void t16_dec_b_imm11    (const thumb_uop_t *uop);
+extern void t16_dec_b_cond     (const thumb_uop_t *uop);
+extern void t16_dec_ldr_imm5   (const thumb_uop_t *uop);
+extern void t16_dec_str_imm5   (const thumb_uop_t *uop);
+extern void t16_dec_ldr_pc8    (const thumb_uop_t *uop);
+extern void t16_dec_call_legacy(const thumb_uop_t *uop);
 
-// Phase 2 chunk 7: byte memory helpers for inline LDRB/STRB emit.
+// Phase 2 chunk 7 (redo): byte memory helpers for inline LDRB/STRB emit.
+// JIT-only recognition from uop->raw_op -- no new C symbols on the
+// per-uop indirect-call path (which is what attempt #1 regressed on).
 extern uint8_t arm_readb_n (uint32_t address);
 extern void    arm_writeb_n(uint32_t address, uint8_t value);
 
@@ -228,12 +229,28 @@ static bool emit_thumb_str_imm5(uint8_t rt, uint8_t rn, uint16_t imm) {
     return true;
 }
 
-// Phase 2 chunk 7: Thumb LDRB Rd, [Rn, #imm5] (byte offset, 0..31).
-// arg_a=Rd, arg_b=Rn, arg_c=imm5. arm_readb_n returns uint8_t; we
-// extu.b the result before storing so high bits of arm_r.r[Rd] are
-// zero (matches arm_r.r[op.rt] = arm_readb_n(op.addr) in the legacy
-// path -- the assignment widens uint8_t -> uint32_t with zero ext).
-// 8 SH4 instructions + 1 literal.
+// Phase 2 chunk 7 (redo): JIT-only Thumb LDRB/STRB imm5 recognition.
+//
+// Attempt #1 added t16_dec_ldrb_imm5 / t16_dec_strb_imm5 as new C
+// handlers in arm.c and wired them in the thumb decoder. Bench
+// confirmed bucket-7 fully drained but thumb_mode regressed ~7% in
+// the HALT loop -- the I-cache pressure pattern that bit Phase 1
+// attempt #2 returned because the per-uop indirect-call site
+// `ops[i].handler(&ops[i])` got two more targets in its target set.
+//
+// This redo follows the chunks-3-6 pattern: detect bucket 7 from
+// uop->raw_op at JIT compile time, emit the spec inline, leave the
+// interpreter's t16_dec_call_legacy path untouched. Non-JIT'd blocks
+// still pay legacy cost for these ops, but JIT'd blocks (which
+// dominate hot paths after the first frames) get the inline emit.
+//
+// Encoding (Thumb):
+//   bits 15..11 = 0b01110 -> STRB Rd, [Rn, #imm5]
+//   bits 15..11 = 0b01111 -> LDRB Rd, [Rn, #imm5]
+//   bits 10..6  = imm5 (unscaled, 0..31)
+//   bits 5..3   = Rn (R0..R7)
+//   bits 2..0   = Rd (R0..R7)
+
 static bool emit_thumb_ldrb_imm5(uint8_t rd, uint8_t rn, uint16_t imm) {
     emit_movl_disp_rm_rn((uint8_t)(rn & 0xF), 8, 0);        // r0 = arm_r.r[Rn]
     emit_add_imm_rn((int8_t)imm, 0);                         // r0 += imm
@@ -246,10 +263,6 @@ static bool emit_thumb_ldrb_imm5(uint8_t rd, uint8_t rn, uint16_t imm) {
     return true;
 }
 
-// Phase 2 chunk 7: Thumb STRB Rd, [Rn, #imm5]. arm_writeb_n takes
-// (addr, value) in r4/r5; the helper's uint8_t parameter means the
-// SH4 calling convention narrows r5 implicitly, so no extu.b needed
-// on the caller side. 7 SH4 instructions + 1 literal.
 static bool emit_thumb_strb_imm5(uint8_t rt, uint8_t rn, uint16_t imm) {
     emit_movl_disp_rm_rn((uint8_t)(rn & 0xF), 8, 0);        // r0 = arm_r.r[Rn]
     emit_add_imm_rn((int8_t)imm, 0);                         // r0 += imm
@@ -259,6 +272,17 @@ static bool emit_thumb_strb_imm5(uint8_t rt, uint8_t rn, uint16_t imm) {
     emit_jsr_at_rn(0);
     emit_nop();
     return true;
+}
+
+// Returns 1 for LDRB, 2 for STRB, 0 otherwise. Extracts Rd/Rn/imm5
+// into the out parameters when the pattern matches.
+static int thumb_ldstb_kind(uint16_t raw_op, uint8_t *rd, uint8_t *rn, uint16_t *imm) {
+    uint8_t top5 = (uint8_t)(raw_op >> 11);
+    if (top5 != 0b01110 && top5 != 0b01111) return 0;
+    *rd  = (uint8_t)(raw_op & 0x7);
+    *rn  = (uint8_t)((raw_op >> 3) & 0x7);
+    *imm = (uint16_t)((raw_op >> 6) & 0x1F);
+    return (top5 == 0b01111) ? 1 : 2;   // 1 = LDRB, 2 = STRB
 }
 
 // Thumb LDR Rd, [PC, #imm8*4] (arg_a = Rd, arg_c = imm8*4 in 0..1020).
@@ -313,13 +337,22 @@ static enum emit_result emit_one_uop(const thumb_uop_t *uop) {
         if (!emit_thumb_str_imm5(uop->arg_a, uop->arg_b, uop->arg_c)) return EMIT_FAIL;
         return EMIT_SPECIALISED;
     }
-    if (uop->handler == t16_dec_ldrb_imm5) {
-        if (!emit_thumb_ldrb_imm5(uop->arg_a, uop->arg_b, uop->arg_c)) return EMIT_FAIL;
-        return EMIT_SPECIALISED;
-    }
-    if (uop->handler == t16_dec_strb_imm5) {
-        if (!emit_thumb_strb_imm5(uop->arg_a, uop->arg_b, uop->arg_c)) return EMIT_FAIL;
-        return EMIT_SPECIALISED;
+    // Phase 2 chunk 7 (redo): LDRB/STRB imm5 recognised from raw_op.
+    // No new C handlers -- interpreter side keeps routing these to
+    // t16_dec_call_legacy, which keeps the per-uop indirect-call
+    // target set unchanged from chunks 1-6.
+    if (uop->handler == t16_dec_call_legacy) {
+        uint8_t  rd, rn;
+        uint16_t imm;
+        int kind = thumb_ldstb_kind(uop->raw_op, &rd, &rn, &imm);
+        if (kind == 1) {  // LDRB
+            if (!emit_thumb_ldrb_imm5(rd, rn, imm)) return EMIT_FAIL;
+            return EMIT_SPECIALISED;
+        }
+        if (kind == 2) {  // STRB
+            if (!emit_thumb_strb_imm5(rd, rn, imm)) return EMIT_FAIL;
+            return EMIT_SPECIALISED;
+        }
     }
     if (uop->handler == t16_dec_ldr_pc8) {
         if (!emit_thumb_ldr_pc8(uop->arg_a, uop->arg_c)) return EMIT_FAIL;
