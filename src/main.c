@@ -103,6 +103,26 @@ static size_t safe_append(char *buf, size_t bufsize, size_t n,
     return n;
 }
 
+#if GBA_DIAG_LOG
+// World-switched diag log append. Same rationale as rom_buffer's chunk-load
+// path and save_file's save_write: the Fugue filesystem fragment-table
+// lookup needs OS-world state, otherwise a fragmented file's fopen/fwrite
+// panics the calculator under sustained load. snap_dump fires on a fixed
+// frame schedule, so on long runs it does this repeatedly; without the
+// wrap, the cumulative pressure was triggering the trace-build reboots.
+struct snap_log_args {
+    const void *buf;
+    size_t      bytes;
+};
+static int do_snap_log_append(struct snap_log_args *a) {
+    FILE *log = fopen("fxgba_log.txt", "a");
+    if (!log) return -1;
+    fwrite(a->buf, 1, a->bytes, log);
+    fclose(log);
+    return 0;
+}
+#endif
+
 int main(void) {
     // Set up on-chip RAM backup BEFORE any code that might world-switch
     // (file I/O during BIOS/ROM init, etc.). Must happen before any code
@@ -839,17 +859,14 @@ int main(void) {
             }
             n = safe_append(buf, sizeof(buf), n, "\n");
 
-            FILE *log = fopen("fxgba_log.txt", "a");
-            if (log) {
-                fwrite(buf, 1, n, log);
-                fclose(log);
-                if (is_scheduled) dumps_done++;
-                if (is_spike) {
-                    spike_dumps++;
-                    last_spike_frame = loop_frame;
-                }
-                if (is_manual) manual_dumps++;
+            struct snap_log_args sla = { .buf = buf, .bytes = n };
+            gint_world_switch(GINT_CALL(do_snap_log_append, (void *)&sla));
+            if (is_scheduled) dumps_done++;
+            if (is_spike) {
+                spike_dumps++;
+                last_spike_frame = loop_frame;
             }
+            if (is_manual) manual_dumps++;
         }
 #endif // GBA_DIAG_LOG
     }
