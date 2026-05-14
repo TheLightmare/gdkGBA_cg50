@@ -36,6 +36,8 @@
 // to avoid touching bench.h until we settle on a permanent name.
 extern uint32_t bench_arm_jit_compiled;
 extern uint32_t bench_arm_jit_specialized_ops;
+extern uint32_t bench_arm_jit_attempts;
+extern uint32_t bench_arm_jit_arena_full;
 
 // Handlers we specialise inline. Declared locally to avoid pulling
 // every arm_dec_* declaration into the header.
@@ -812,9 +814,14 @@ bool arm_jit_compile_block(arm_block_t *b) {
     // page-gen tracking (see thumb_block.c) those stable copies now
     // survive the cart's data writes and stay JIT'd.
 
+    BENCH_INC(bench_arm_jit_attempts);
+
     size_t budget = estimate_block_bytes(b->length);
     uint16_t *entry = jit_emit_begin(budget);
-    if (!entry) return false;
+    if (!entry) {
+        BENCH_INC(bench_arm_jit_arena_full);
+        return false;
+    }
 
     emit_movl_pc_lit_reset();
 

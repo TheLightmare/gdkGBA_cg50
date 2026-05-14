@@ -124,6 +124,26 @@ extern uint32_t bench_thumb_jit_specialized_ops;
 extern uint32_t bench_arm_jit_compiled;
 extern uint32_t bench_arm_jit_specialized_ops;
 
+// Phase 2 chunk 8 (instrumented): JIT-compile attempt counters.
+//
+//   attempts        - times the executor called arm/thumb_jit_compile_block
+//                     after a block hit the hot-block threshold
+//   arena_full      - subset of attempts that failed at jit_emit_begin
+//                     because the bump-cursor ran out of room
+//
+// Successful attempts are already counted by *_jit_compiled. The
+// difference (attempts - compiled - arena_full) is "other failure":
+// estimate_block_bytes too large for any pool slot, literal pool
+// overflow, etc. -- typically small.
+//
+// Use these to disambiguate threshold-tuning trade-offs:
+//   high arena_full / attempts ratio -> arena saturated, raise threshold
+//   low ratio with HALT regression  -> warmup tax dominant, lower threshold
+extern uint32_t bench_arm_jit_attempts;
+extern uint32_t bench_arm_jit_arena_full;
+extern uint32_t bench_thumb_jit_attempts;
+extern uint32_t bench_thumb_jit_arena_full;
+
 #else  // !GBA_BENCH
 
 // Release builds: bench is fully compiled out. Provide an inline no-op

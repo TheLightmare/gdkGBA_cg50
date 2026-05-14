@@ -41,6 +41,11 @@ uint32_t bench_thumb_jit_specialized_ops;
 uint32_t bench_arm_jit_compiled;
 uint32_t bench_arm_jit_specialized_ops;
 
+uint32_t bench_arm_jit_attempts;
+uint32_t bench_arm_jit_arena_full;
+uint32_t bench_thumb_jit_attempts;
+uint32_t bench_thumb_jit_arena_full;
+
 static int bench_tmu_id = -1;
 static uint32_t bench_tcor;
 

@@ -375,9 +375,14 @@ bool thumb_jit_compile_block(thumb_block_t *b) {
     // unrelated code -- stable copy-to-IWRAM code can survive the
     // cart's normal data churn and stay JIT'd.
 
+    BENCH_INC(bench_thumb_jit_attempts);
+
     size_t budget = estimate_block_bytes(b->length);
     uint16_t *entry = jit_emit_begin(budget);
-    if (!entry) return false;
+    if (!entry) {
+        BENCH_INC(bench_thumb_jit_arena_full);
+        return false;
+    }
 
     emit_movl_pc_lit_reset();
 

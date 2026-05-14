@@ -834,6 +834,8 @@ int main(void) {
                     "  thumb_legacy=%lu (%lu/frame)  hist 0..F: %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n"
                     "  thumb_jit_compiled=%lu  thumb_jit_specialized_ops=%lu\n"
                     "  arm_jit_compiled=%lu  arm_jit_specialized_ops=%lu\n"
+                    "  arm_jit_attempts=%lu  arm_jit_arena_full=%lu\n"
+                    "  thumb_jit_attempts=%lu  thumb_jit_arena_full=%lu\n"
                     "  slow_read=%lu  slow_write=%lu  chunk_miss=%lu\n",
                     (unsigned long)frames_in_span,
                     (unsigned long)bench_freq_hz,
@@ -894,6 +896,10 @@ int main(void) {
                     (unsigned long)bench_thumb_jit_specialized_ops,
                     (unsigned long)bench_arm_jit_compiled,
                     (unsigned long)bench_arm_jit_specialized_ops,
+                    (unsigned long)bench_arm_jit_attempts,
+                    (unsigned long)bench_arm_jit_arena_full,
+                    (unsigned long)bench_thumb_jit_attempts,
+                    (unsigned long)bench_thumb_jit_arena_full,
                     (unsigned long)bench_mem_slow_read,
                     (unsigned long)bench_mem_slow_write,
                     (unsigned long)bench_chunk_miss);
@@ -921,6 +927,10 @@ int main(void) {
                 bench_thumb_jit_specialized_ops = 0;
                 bench_arm_jit_compiled = 0;
                 bench_arm_jit_specialized_ops = 0;
+                bench_arm_jit_attempts = 0;
+                bench_arm_jit_arena_full = 0;
+                bench_thumb_jit_attempts = 0;
+                bench_thumb_jit_arena_full = 0;
             }
             n = safe_append(buf, sizeof(buf), n, "\n");
 
