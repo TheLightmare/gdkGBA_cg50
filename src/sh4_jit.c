@@ -5,6 +5,11 @@
 
 #include <gint/kmalloc.h>
 
+#include "arm_block.h"
+#include "bench.h"
+#include "build_flags.h"
+#include "thumb_block.h"
+
 // ----- Arena ---------------------------------------------------------------
 
 bool jit_enabled = false;
@@ -48,11 +53,34 @@ void jit_reset(void) {
     jit_arena_cursor = jit_arena_base;
 }
 
+void jit_arena_recycle(void) {
+    if (!jit_enabled) return;
+    // Clear native_entry on every directory slot before recycling the
+    // arena. Old pointers would refer to about-to-be-overwritten
+    // memory, so any future executor lookup that hit them would jump
+    // into stale or partially-rewritten code. NULL is the universal
+    // "fall back to interpreter" signal.
+    arm_block_clear_native_entries();
+    thumb_block_clear_native_entries();
+    jit_arena_cursor = jit_arena_base;
+#if GBA_BENCH
+    bench_jit_arena_recycles++;
+#endif
+}
+
 uint16_t *jit_emit_begin(size_t budget_bytes) {
     if (!jit_enabled) return NULL;
     size_t remaining = (size_t)((uint8_t *)jit_arena_end -
                                 (uint8_t *)jit_arena_cursor);
-    if (remaining < budget_bytes) return NULL;
+    if (remaining < budget_bytes) {
+        // Arena exhausted: recycle and retry. After recycling, the full
+        // arena is available; if even that can't fit the request the
+        // block is genuinely too big and we bail.
+        jit_arena_recycle();
+        remaining = (size_t)((uint8_t *)jit_arena_end -
+                             (uint8_t *)jit_arena_cursor);
+        if (remaining < budget_bytes) return NULL;
+    }
     return jit_arena_cursor;
 }
 

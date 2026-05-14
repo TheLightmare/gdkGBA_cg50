@@ -41,6 +41,8 @@ uint32_t bench_thumb_jit_specialized_ops;
 uint32_t bench_arm_jit_compiled;
 uint32_t bench_arm_jit_specialized_ops;
 
+uint32_t bench_jit_arena_recycles;
+
 static int bench_tmu_id = -1;
 static uint32_t bench_tcor;
 
