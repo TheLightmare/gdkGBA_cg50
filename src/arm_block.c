@@ -26,7 +26,11 @@ static uint32_t arm_uop_pool_head = 0;
 // already call thumb_block_invalidate_page(addr) on every RAM write;
 // that bumps the shared thumb_page_gen[] entry, and our lookup checks
 // it the same way. No new write hooks needed.
-#define ARM_PAGE_BITS    8u
+// Must match THUMB_PAGE_BITS in thumb_block.c -- ARM and Thumb share
+// the same thumb_page_gen[] array and ram_page_idx must produce the
+// same indices for the same address. See thumb_block.c for the
+// rationale behind the chosen granularity.
+#define ARM_PAGE_BITS    6u
 #define ARM_PAGE_SIZE    (1u << ARM_PAGE_BITS)
 #define ARM_PAGE_MASK    (ARM_PAGE_SIZE - 1u)
 #define ARM_IWRAM_PAGES  (0x8000u / ARM_PAGE_SIZE)

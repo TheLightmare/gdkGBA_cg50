@@ -289,12 +289,11 @@ bool thumb_jit_compile_block(thumb_block_t *b) {
     if (b->length == 0)                  return false;
     if (b->length > THUMB_BLOCK_MAX_LEN) return false;
 
-    // ROM-only restriction: 0xFFFF == THUMB_PAGE_NONE = "ROM block, no
-    // RAM page-gen check". RAM-resident blocks get invalidated whenever
-    // the cart writes to their page, so their codegen would be quickly
-    // wasted and the arena would fill with churn that benefits nothing.
-    // Skip them so stable ROM code keeps the arena slots.
-    if (b->page_idx != 0xFFFFu) return false;
+    // Chunk 7: RAM-resident blocks are now JIT candidates again. The
+    // finer page-gen granularity (64-byte pages, down from 256) means
+    // a data write to a page-co-tenant variable no longer invalidates
+    // unrelated code -- stable copy-to-IWRAM code can survive the
+    // cart's normal data churn and stay JIT'd.
 
     size_t budget = estimate_block_bytes(b->length);
     uint16_t *entry = jit_emit_begin(budget);

@@ -23,22 +23,29 @@ static uint32_t thumb_uop_pool_head = 0;
 
 // Page-generation tracking for RAM-resident blocks.
 //
-// A "page" is 256 bytes. Pages 0..127 cover IWRAM (32 KB), pages
-// 128..1151 cover EWRAM (256 KB max). The arm_mem.c write paths bump
-// the gen for the page they wrote into; cached RAM blocks store the
-// page gen they saw at decode time, and the lookup compares it
-// against the current gen to detect overwrites.
+// A "page" is 64 bytes (Phase 1 chunk 7 -- previously 256). The smaller
+// granularity dramatically reduces false-positive invalidations: a data
+// write to a page-co-tenant variable no longer marks unrelated code in
+// the same page as stale. Code copied into IWRAM and read-only after
+// (a common GBA cart pattern) now stays JIT'd across the cart's data
+// writes to neighbouring memory.
+//
+// Pages 0..511 cover IWRAM (32 KB), pages 512..4607 cover EWRAM
+// (256 KB max). The arm_mem.c write paths bump the gen for the page
+// they wrote into; cached RAM blocks store the page gen they saw at
+// decode time, and the lookup compares it against the current gen to
+// detect overwrites.
 //
 // uint16_t means a page can be written 65535 times before the gen
 // counter wraps. After wrap, a stale block whose stored gen happens
 // to match the current gen would falsely pass the freshness check
 // (cart misbehaves until the block is naturally evicted by pool
 // rotation -- not a correctness issue per se but worth knowing).
-#define THUMB_PAGE_BITS    8u
+#define THUMB_PAGE_BITS    6u
 #define THUMB_PAGE_SIZE    (1u << THUMB_PAGE_BITS)
 #define THUMB_PAGE_MASK    (THUMB_PAGE_SIZE - 1u)
-#define THUMB_IWRAM_PAGES  (0x8000u / THUMB_PAGE_SIZE)        // 128
-#define THUMB_EWRAM_PAGES  (0x40000u / THUMB_PAGE_SIZE)       // 1024
+#define THUMB_IWRAM_PAGES  (0x8000u / THUMB_PAGE_SIZE)        // 512
+#define THUMB_EWRAM_PAGES  (0x40000u / THUMB_PAGE_SIZE)       // 4096
 #define THUMB_TOTAL_PAGES  (THUMB_IWRAM_PAGES + THUMB_EWRAM_PAGES)
 #define THUMB_PAGE_NONE    0xFFFFu
 

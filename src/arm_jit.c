@@ -65,10 +65,10 @@ bool arm_jit_compile_block(arm_block_t *b) {
     if (b->length == 0)                return false;
     if (b->length > ARM_BLOCK_MAX_LEN) return false;
 
-    // ROM-only restriction (same rationale as the Thumb side): RAM
-    // blocks get invalidated by page-gen bumps, so JIT'ing them just
-    // burns arena. 0xFFFF == ARM_PAGE_NONE = "ROM block".
-    if (b->page_idx != 0xFFFFu) return false;
+    // Chunk 7: RAM-resident ARM blocks are now JIT candidates again.
+    // Many GBA carts copy ARM hot-paths into IWRAM; with finer-grained
+    // page-gen tracking (see thumb_block.c) those stable copies now
+    // survive the cart's data writes and stay JIT'd.
 
     size_t budget = estimate_block_bytes(b->length);
     uint16_t *entry = jit_emit_begin(budget);
