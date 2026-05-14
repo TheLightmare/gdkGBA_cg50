@@ -388,10 +388,3 @@ const arm_block_t *arm_block_decode(uint32_t inst_pc) {
 #endif
     return slot;
 }
-
-void arm_block_clear_native_entries(void) {
-    if (!arm_block_dir) return;
-    for (uint32_t i = 0; i < ARM_BLOCK_DIR_SIZE; i++) {
-        arm_block_dir[i].native_entry = NULL;
-    }
-}

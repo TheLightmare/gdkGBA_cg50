@@ -75,13 +75,6 @@ void thumb_block_invalidate_page(uint32_t addr) {
     }
 }
 
-void thumb_block_clear_native_entries(void) {
-    if (!thumb_block_dir) return;
-    for (uint32_t i = 0; i < THUMB_BLOCK_DIR_SIZE; i++) {
-        thumb_block_dir[i].native_entry = NULL;
-    }
-}
-
 // thumb_proc[] is defined in arm.c. The Phase 4b legacy fallback
 // handler dispatches through it for opcodes without a specialised
 // uop-aware handler.

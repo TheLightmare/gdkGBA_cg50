@@ -46,13 +46,6 @@ bool jit_init(void);
 // Phase 0 never invokes it.
 void jit_reset(void);
 
-// Full arena recycle: NULL every block_t::native_entry across both
-// directories and rewind the cursor to base. Triggered automatically
-// by jit_emit_begin() when the budget can't fit. Bench counter
-// bench_jit_arena_recycles ticks each call so we can see how often
-// the steady-state working set overflows the arena.
-void jit_arena_recycle(void);
-
 // Begin a new block. Returns the current cursor (= entry point for
 // the block being emitted) if at least budget_bytes remain in the
 // arena; NULL otherwise.

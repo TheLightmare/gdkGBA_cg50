@@ -124,12 +124,6 @@ extern uint32_t bench_thumb_jit_specialized_ops;
 extern uint32_t bench_arm_jit_compiled;
 extern uint32_t bench_arm_jit_specialized_ops;
 
-// Number of times the JIT arena ran out of space and was recycled
-// (all native_entry pointers cleared, cursor reset to base). Used to
-// gauge whether the arena is big enough for the steady-state working
-// set. Each recycle is ~0.6 ms of directory-clear work.
-extern uint32_t bench_jit_arena_recycles;
-
 #else  // !GBA_BENCH
 
 // Release builds: bench is fully compiled out. Provide an inline no-op

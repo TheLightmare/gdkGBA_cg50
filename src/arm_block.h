@@ -72,10 +72,6 @@ void arm_block_uninit(void);
 const arm_block_t *arm_block_lookup(uint32_t inst_pc);
 const arm_block_t *arm_block_decode(uint32_t inst_pc);
 
-// See thumb_block.h: NULL every directory slot's native_entry before
-// the JIT arena cursor is reset.
-void arm_block_clear_native_entries(void);
-
 // Direct-mapped index from ARM-instruction PC. ARM instructions are
 // 4-byte aligned, so shift by 2 to spread the entropy.
 static inline uint32_t arm_block_hash(uint32_t inst_pc) {
