@@ -75,6 +75,11 @@ void emit_add_imm_rn(int8_t imm, uint8_t rn) {
     jit_emit16((uint16_t)(0x7000 | (R(rn) << 8) | (uint8_t)imm));
 }
 
+void emit_add_rr(uint8_t rm, uint8_t rn) {
+    // add Rm, Rn   :   0011 nnnn mmmm 1100   (no flags; T unchanged)
+    jit_emit16((uint16_t)(0x300C | (R(rn) << 8) | (R(rm) << 4)));
+}
+
 void emit_tst_rr(uint8_t rm, uint8_t rn) {
     // tst Rm, Rn   :   0010 nnnn mmmm 1000
     jit_emit16((uint16_t)(0x2008 | (R(rn) << 8) | (R(rm) << 4)));

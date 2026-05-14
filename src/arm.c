@@ -222,6 +222,13 @@ static inline bool arm_cond(int8_t cond) {
     return res;
 }
 
+// Non-inline wrapper exported for JIT codegen to JSR to. The body
+// inlines arm_cond at compile time so cycle cost is the same as the
+// inline version plus one call frame.
+bool arm_cond_check(int8_t cond) {
+    return arm_cond(cond);
+}
+
 static void arm_spsr_get(uint32_t *psr) {
     switch (arm_r.cpsr & 0x1f) {
         case ARM_FIQ: *psr = arm_r.spsr_fiq; break;

@@ -43,6 +43,7 @@ void emit_extub_rm_rn(uint8_t rm, uint8_t rn);
 
 void emit_mov_imm_rn(int8_t imm, uint8_t rn);       // mov #imm, Rn   (signed 8)
 void emit_add_imm_rn(int8_t imm, uint8_t rn);       // add #imm, Rn   (signed 8)
+void emit_add_rr    (uint8_t rm, uint8_t rn);        // add Rm, Rn     (reg+reg, no flags)
 void emit_tst_rr    (uint8_t rm, uint8_t rn);        // tst Rm, Rn
 
 // ----- Control flow --------------------------------------------------------

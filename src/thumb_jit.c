@@ -44,7 +44,11 @@
 extern uint32_t arm_flag_n;
 extern uint32_t arm_flag_z;
 
+extern bool int_halt;
+
 extern void t16_dec_mov_imm8(const thumb_uop_t *uop);
+extern void t16_dec_b_imm11(const thumb_uop_t *uop);
+extern void t16_dec_b_cond (const thumb_uop_t *uop);
 
 // ----- Internal helpers ----------------------------------------------------
 
@@ -106,12 +110,105 @@ static bool emit_thumb_mov_imm8(uint8_t rd, uint8_t imm8) {
     return true;
 }
 
+// Thumb B #imm11 (arg_c = sign-extended imm11<<1 in int16). Block-ending.
+//   arm_r.r[15] += imm
+//   if (imm == -4) int_halt = true       (idle-spin: `b .` waits for IRQ)
+//   arm_load_pipe()
+// The handler returns having set pipe_reload=true (via arm_load_pipe),
+// so the post-block check correctly takes the skip-sequential-exit
+// branch. ~7-10 SH4 instructions + 2-3 literals.
+static bool emit_thumb_b_imm11(int32_t imm) {
+    // r0 = arm_r.r[15]
+    emit_movl_disp_rm_rn(15, 8, 0);
+    // r0 += imm. imm range is [-2048, +2046] (imm11<<1). SH4 add #imm
+    // sign-extends an 8-bit imm; if imm fits int8 we can skip the
+    // literal-pool load.
+    if (imm >= -128 && imm <= 127) {
+        emit_add_imm_rn((int8_t)imm, 0);
+    } else {
+        // r1 = imm (32-bit literal); r0 += r1
+        if (!emit_movl_pc_lit((uint32_t)imm, 1)) return false;
+        emit_add_rr(1, 0);
+    }
+    // arm_r.r[15] = r0
+    emit_movl_rm_disp_rn(0, 15, 8);
+
+    // The `b .` idle spin: hand off to arm_exec's int_halt path so we
+    // don't burn cycles re-entering the same block until target_cycles.
+    if (imm == -4) {
+        emit_mov_imm_rn(1, 0);                                          // r0 = 1
+        if (!emit_movl_pc_lit((uint32_t)(uintptr_t)&int_halt, 1))       // r1 = &int_halt
+            return false;
+        emit_movb_rm_at_rn(0, 1);                                       // *r1 = (byte)r0
+    }
+
+    // arm_load_pipe(); sets pipe_reload = true.
+    if (!emit_movl_pc_lit((uint32_t)(uintptr_t)&arm_load_pipe, 0)) return false;
+    emit_jsr_at_rn(0);
+    emit_nop();
+    return true;
+}
+
+// Thumb B<cond> #imm8 (arg_a = cond 0..13, arg_c = sign-extended imm8<<1
+// in int16, range [-256, +254]). Block-ending. Always fits SH4 add #imm.
+//   if (arm_cond(cond)) { arm_r.r[15] += imm; arm_load_pipe(); }
+// Codegen: set r4 = cond, JSR arm_cond_check, then bt over the branch
+// body if r0 == 0 (cond false). When cond is true we run the same
+// branch-take sequence as B imm11. ~13 SH4 instructions + 3 literals.
+//
+// Conds 14 and 15 are decoded as UDF/SWI (decoder routes them through
+// the legacy fallback), so we never see them here -- but we still
+// guard defensively.
+static bool emit_thumb_b_cond(uint8_t cond, int32_t imm) {
+    if (cond >= 14) return false;     // decoder shouldn't emit this
+    if (imm < -128 || imm > 127) return false;   // out of cond-B range
+
+    // r4 = cond
+    emit_mov_imm_rn((int8_t)cond, 4);
+    // r0 = &arm_cond_check
+    if (!emit_movl_pc_lit((uint32_t)(uintptr_t)&arm_cond_check, 0))
+        return false;
+    // jsr @r0 ; nop          (r0 := bool result on return)
+    emit_jsr_at_rn(0);
+    emit_nop();
+    // tst r0, r0             (T = (r0 == 0) => cond was false)
+    emit_tst_rr(0, 0);
+    // bt over the branch-take sequence. 6 instructions follow; target
+    // is the instruction immediately after them, so disp_insts = 5
+    // (bt target = bt_pc + 4 + 2*disp, lands at +14 = 7th-slot offset).
+    emit_bt(5);
+
+    // r15 += imm (imm fits int8 for cond-B)
+    emit_movl_disp_rm_rn(15, 8, 0);
+    emit_add_imm_rn((int8_t)imm, 0);
+    emit_movl_rm_disp_rn(0, 15, 8);
+
+    // arm_load_pipe()
+    if (!emit_movl_pc_lit((uint32_t)(uintptr_t)&arm_load_pipe, 0)) return false;
+    emit_jsr_at_rn(0);
+    emit_nop();
+    return true;
+}
+
 // Dispatch one uop. Returns SPECIALISED, FALLBACK_OK, or FAIL.
 enum emit_result { EMIT_SPECIALISED, EMIT_FALLBACK, EMIT_FAIL };
 
 static enum emit_result emit_one_uop(const thumb_uop_t *uop) {
     if (uop->handler == t16_dec_mov_imm8) {
         if (!emit_thumb_mov_imm8(uop->arg_a, uop->arg_b)) return EMIT_FAIL;
+        return EMIT_SPECIALISED;
+    }
+    if (uop->handler == t16_dec_b_imm11) {
+        if (!emit_thumb_b_imm11((int32_t)(int16_t)uop->arg_c)) return EMIT_FAIL;
+        return EMIT_SPECIALISED;
+    }
+    if (uop->handler == t16_dec_b_cond) {
+        if (!emit_thumb_b_cond(uop->arg_a, (int32_t)(int16_t)uop->arg_c)) {
+            // Spec rejected (out-of-range imm, cond>=14, lit overflow);
+            // fall through to JSR fallback so the block still runs.
+            if (!emit_jsr_fallback(uop)) return EMIT_FAIL;
+            return EMIT_FALLBACK;
+        }
         return EMIT_SPECIALISED;
     }
     if (!emit_jsr_fallback(uop)) return EMIT_FAIL;

@@ -134,6 +134,11 @@ extern bool int_halt;
 extern bool pipe_reload;
 void arm_load_pipe(void);
 
+// Non-inline shim around the static-inline arm_cond() in arm.c, for JIT
+// codegen to JSR to. Same semantics as arm_cond(): returns true iff the
+// ARM 4-bit condition code matches the current lazy NZCV flags.
+bool arm_cond_check(int8_t cond);
+
 void arm_init();
 void arm_uninit();
 
