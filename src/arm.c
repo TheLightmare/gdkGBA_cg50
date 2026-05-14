@@ -4161,6 +4161,35 @@ uint32_t arm_jit_subs(uint32_t lhs, uint32_t rhs) {
     return res;
 }
 
+// ---- Phase 2 chunk 4: imm-shift shifter helpers --------------------------
+//
+// Value-only variants: return shifted value, do NOT touch arm_flag_c.
+// Used by the JIT to compute the second operand of a data-proc REG op
+// when the shift is non-zero. The caller decides whether the op
+// updates flags (and hands the shifted value to arm_jit_adds/subs/cmp/...).
+//
+// shift_imm is guaranteed by the recogniser to be in [1, 31]; the special
+// encodings (LSR #32, ASR #32, RRX) fall through to legacy.
+//
+// TST/TEQ with shift would need to additionally stage the shifter cout
+// into arm_flag_c -- deferred to a follow-up chunk.
+
+uint32_t arm_jit_lsl_v(uint32_t val, uint32_t sh) {
+    return val << sh;
+}
+
+uint32_t arm_jit_lsr_v(uint32_t val, uint32_t sh) {
+    return val >> sh;
+}
+
+uint32_t arm_jit_asr_v(uint32_t val, uint32_t sh) {
+    return (uint32_t)((int32_t)val >> sh);
+}
+
+uint32_t arm_jit_ror_v(uint32_t val, uint32_t sh) {
+    return (val >> sh) | (val << (32u - sh));
+}
+
 void arm_init() {
     // Initialize memory buffer contents, not the pointers themselves
     // as they are already declared as arrays

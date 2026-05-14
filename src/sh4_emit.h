@@ -80,10 +80,12 @@ void emit_bra (int16_t disp_insts);   // unconditional, delay slot follows
 // Returns false if the fixup table is full -- callers must check and
 // bail (typically by skipping codegen for an overly-large block).
 
-// Sized to cover a max-length Thumb block: 2 literals per uop (uop ptr
-// + handler) plus a handful for global addresses (pipe_reload,
-// arm_load_pipe). 2 * THUMB_BLOCK_MAX_LEN + 8 with headroom.
-#define SH4_LIT_POOL_MAX 160
+// Sized so that a max-length ARM block (64 uops) whose every uop hits
+// the chunk-4 worst case -- cond-checked + shifted + flag-update --
+// still fits. That uop uses 3 literals (cond_check addr, shifter addr,
+// flag-helper addr) so the upper bound is 64 * 3 = 192. Round up plus
+// headroom for block-level globals (pipe_reload, arm_load_pipe).
+#define SH4_LIT_POOL_MAX 256
 
 void emit_movl_pc_lit_reset(void);
 bool emit_movl_pc_lit(uint32_t value, uint8_t rn);

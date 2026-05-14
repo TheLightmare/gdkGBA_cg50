@@ -55,6 +55,12 @@ extern void     arm_jit_teq (uint32_t lhs, uint32_t rhs);
 extern uint32_t arm_jit_adds(uint32_t lhs, uint32_t rhs);
 extern uint32_t arm_jit_subs(uint32_t lhs, uint32_t rhs);
 
+// Phase 2 chunk 4 shifter helpers (value-only; arm_flag_c unchanged).
+extern uint32_t arm_jit_lsl_v(uint32_t val, uint32_t sh);
+extern uint32_t arm_jit_lsr_v(uint32_t val, uint32_t sh);
+extern uint32_t arm_jit_asr_v(uint32_t val, uint32_t sh);
+extern uint32_t arm_jit_ror_v(uint32_t val, uint32_t sh);
+
 static size_t estimate_block_bytes(uint16_t length) {
     // Worst case per uop: cond-checked BL imm24 = 6 (cond prefix) +
     // 12 (body) = 18 SH4 instructions = 36 B + 3 literals = ~48 B.
@@ -250,25 +256,43 @@ static void emit_arm_dp_reg_body(uint8_t opc, uint8_t rn, uint8_t rd, uint8_t rm
 
 static int  emit_arm_dp_reg_s1_size(uint8_t opc);
 static bool emit_arm_dp_reg_s1_body(uint8_t opc, uint8_t rn, uint8_t rd, uint8_t rm);
+static int  emit_arm_dp_reg_shifted_size(uint8_t opc, int kind);
+static bool emit_arm_dp_reg_shifted_body(uint8_t opc, uint8_t rn, uint8_t rd,
+                                         uint8_t rm, uint8_t shift_type,
+                                         uint8_t shift_imm, int kind);
 
 static bool emit_arm_dp_reg(uint8_t cond, uint32_t op, int kind) {
-    uint8_t opc = (op >> 21) & 0xF;
-    uint8_t rn  = (op >> 16) & 0xF;
-    uint8_t rd  = (op >> 12) & 0xF;
-    uint8_t rm  =  op        & 0xF;
+    uint8_t opc        = (op >> 21) & 0xF;
+    uint8_t rn         = (op >> 16) & 0xF;
+    uint8_t rd         = (op >> 12) & 0xF;
+    uint8_t rm         =  op        & 0xF;
+    uint8_t shift_imm  = (op >> 7)  & 0x1F;
+    uint8_t shift_type = (op >> 5)  & 0x3;
 
-    int body_size = (kind == 2) ? emit_arm_dp_reg_s1_size(opc)
-                                : emit_arm_dp_reg_size   (opc);
+    int body_size;
+    switch (kind) {
+        case 2:  body_size = emit_arm_dp_reg_s1_size(opc);              break;
+        case 3:
+        case 4:  body_size = emit_arm_dp_reg_shifted_size(opc, kind);   break;
+        default: body_size = emit_arm_dp_reg_size(opc);                 break;
+    }
 
     if (cond != 14) {
         if (!emit_arm_cond_check_prefix(cond)) return false;
         emit_bt((int16_t)(body_size - 1));
     }
-    if (kind == 2) {
-        return emit_arm_dp_reg_s1_body(opc, rn, rd, rm);
+
+    switch (kind) {
+        case 2:
+            return emit_arm_dp_reg_s1_body(opc, rn, rd, rm);
+        case 3:
+        case 4:
+            return emit_arm_dp_reg_shifted_body(opc, rn, rd, rm,
+                                                shift_type, shift_imm, kind);
+        default:
+            emit_arm_dp_reg_body(opc, rn, rd, rm);
+            return true;
     }
-    emit_arm_dp_reg_body(opc, rn, rd, rm);
-    return true;
 }
 
 // Phase 2 chunk 3: helper-call emit for S=1 flag-update variants.
@@ -320,39 +344,170 @@ static bool emit_arm_dp_reg_s1_body(uint8_t opc, uint8_t rn, uint8_t rd, uint8_t
     return true;
 }
 
-// Recognition: returns 0 if no spec, 1 for chunk-1 (no-flag inline),
-// 2 for chunk-3 (flag-update helper call). Both flavours share the
-// no-shift / Rd!=15 guards and the group=000 / LSL #0 patterns.
+// Phase 2 chunk 4: imm-shift forms. Common shape is a shifter-call
+// preamble that leaves shifted Rm in r0, followed by the same body
+// machinery the chunks-1/3 ops already use (re-keyed to read shifted
+// Rm from r0 instead of a fresh memory load).
+//
+// Shifter preamble (5 SH4 insts + 1 literal):
+//   mov.l @(rm, r8), r4         ; r4 = Rm
+//   mov  #imm, r5                ; r5 = shift_imm (always in [1,31])
+//   mov.l @(pc, lit), r0         ; r0 = &arm_jit_<sh>_v
+//   jsr  @r0
+//   nop                          ; delay slot; r0 := shifted_Rm on return
+
+static void *arm_dp_reg_shifter(uint8_t shift_type) {
+    switch (shift_type) {
+        case 0: return (void *)&arm_jit_lsl_v;
+        case 1: return (void *)&arm_jit_lsr_v;
+        case 2: return (void *)&arm_jit_asr_v;
+        case 3: return (void *)&arm_jit_ror_v;
+        default: return NULL;
+    }
+}
+
+static bool emit_arm_shift_preamble(uint8_t rm, uint8_t shift_type, uint8_t shift_imm) {
+    void *helper = arm_dp_reg_shifter(shift_type);
+    if (!helper) return false;
+    emit_movl_disp_rm_rn(rm, 8, 4);
+    emit_mov_imm_rn((int8_t)shift_imm, 5);
+    if (!emit_movl_pc_lit((uint32_t)(uintptr_t)helper, 0))
+        return false;
+    emit_jsr_at_rn(0);
+    emit_nop();
+    return true;
+}
+
+// Op-body sizes for kind 3 (S=0) after the shifter preamble (5 insts).
+// r0 holds shifted Rm at entry to the body.
+static int dp_reg_shifted_s0_body_size(uint8_t opc) {
+    switch (opc) {
+        case 0xD: return 1;                 // MOV: store r0 to Rd
+        case 0xF: return 2;                 // MVN: not + store
+        case 0xE: return 4;                 // BIC: load Rn, not, and, store
+        default:  return 3;                 // AND/EOR/SUB/RSB/ADD/ORR
+    }
+}
+
+// Op-body sizes for kind 4 (S=1 arith) after the shifter preamble.
+//   r0 = shifted Rm at entry.
+//   common: mov r0,r5; mov.l @(rn,r8),r4; mov.l @(pc,lit_helper),r0; jsr; nop
+//   ADDS/SUBS add a final mov.l r0,@(rd,r8).
+static int dp_reg_shifted_s1_body_size(uint8_t opc) {
+    return opc_writes_dest_s1(opc) ? 6 : 5;
+}
+
+static int emit_arm_dp_reg_shifted_size(uint8_t opc, int kind) {
+    // 5 SH4 insts for the shifter preamble plus the op-body.
+    int op_body = (kind == 4) ? dp_reg_shifted_s1_body_size(opc)
+                              : dp_reg_shifted_s0_body_size(opc);
+    return 5 + op_body;
+}
+
+static bool emit_arm_dp_reg_shifted_body(uint8_t opc, uint8_t rn, uint8_t rd,
+                                         uint8_t rm, uint8_t shift_type,
+                                         uint8_t shift_imm, int kind) {
+    if (!emit_arm_shift_preamble(rm, shift_type, shift_imm)) return false;
+
+    if (kind == 3) {
+        // S=0 inline body. r0 = shifted Rm post-helper.
+        switch (opc) {
+            case 0xD:  // MOV Rd, Rm-shifted
+                emit_movl_rm_disp_rn(0, rd, 8);
+                return true;
+            case 0xF:  // MVN Rd, Rm-shifted
+                emit_not_rr(0, 0);
+                emit_movl_rm_disp_rn(0, rd, 8);
+                return true;
+            default: break;
+        }
+        // 3-operand. Load Rn into r1, combine with shifted Rm in r0.
+        emit_movl_disp_rm_rn(rn, 8, 1);    // r1 = Rn
+        switch (opc) {
+            case 0x0: emit_and_rr(1, 0); break;                 // AND
+            case 0x1: emit_xor_rr(1, 0); break;                 // EOR
+            case 0x2:                                            // SUB Rn - sh
+                emit_sub_rr(0, 1);                               // r1 -= r0
+                emit_movl_rm_disp_rn(1, rd, 8);
+                return true;
+            case 0x3:                                            // RSB sh - Rn
+                emit_sub_rr(1, 0);                               // r0 -= r1
+                break;
+            case 0x4: emit_add_rr(1, 0); break;                 // ADD
+            case 0xC: emit_or_rr (1, 0); break;                 // ORR
+            case 0xE:                                            // BIC Rn & ~sh
+                emit_not_rr(0, 0);                               // r0 = ~sh
+                emit_and_rr(1, 0);                               // r0 &= r1
+                break;
+            default:
+                return false;
+        }
+        emit_movl_rm_disp_rn(0, rd, 8);
+        return true;
+    }
+
+    // kind == 4: S=1 arith helper call. shifted_Rm currently in r0;
+    // move it to r5 (helper arg 2), load Rn into r4 (helper arg 1).
+    void *helper = arm_dp_reg_s1_helper(opc);
+    if (!helper) return false;
+    emit_mov_rr(0, 5);                                  // r5 = shifted_Rm
+    emit_movl_disp_rm_rn(rn, 8, 4);                     // r4 = Rn
+    if (!emit_movl_pc_lit((uint32_t)(uintptr_t)helper, 0))
+        return false;
+    emit_jsr_at_rn(0);
+    emit_nop();
+    if (opc_writes_dest_s1(opc)) {
+        emit_movl_rm_disp_rn(0, rd, 8);
+    }
+    return true;
+}
+
+// Recognition: returns one of
+//   0 = no spec, fall through to JSR fallback
+//   1 = chunk 1: no-shift, S=0, inline body
+//   2 = chunk 3: no-shift, S=1 (TST/TEQ/CMP/CMN/ADDS/SUBS), helper call
+//   3 = chunk 4: imm-shifted, S=0, inline body
+//   4 = chunk 4: imm-shifted, S=1 arith (CMP/CMN/ADDS/SUBS), helper call
+//
+// All flavours share: group=000, imm-shift form (bit 4 = 0), Rd != 15.
+// TST/TEQ with non-zero shift are deferred because their flag handling
+// needs the shifter cout staged into arm_flag_c.
 static int arm_dp_reg_kind(uint32_t op) {
     if (((op >> 25) & 0x7) != 0)  return 0;        // group 0b000
-    if (((op >> 4)  & 0xFF) != 0) return 0;        // LSL #0, imm-shift form
+    if (((op >> 4)  & 0x1) != 0)  return 0;        // bit 4 = 0 -> imm-shift form
     if (((op >> 12) & 0xF) == 15) return 0;        // Rd != 15
 
-    uint8_t opc = (op >> 21) & 0xF;
-    bool    s   = (op >> 20) & 0x1;
+    uint8_t opc        = (op >> 21) & 0xF;
+    bool    s          = (op >> 20) & 0x1;
+    uint8_t shift_imm  = (op >> 7)  & 0x1F;
+    uint8_t shift_type = (op >> 5)  & 0x3;
+
+    // Special-encoding shift forms (LSR #32, ASR #32, RRX) -- defer.
+    if (shift_imm == 0 && shift_type != 0) return 0;
+
+    bool shifted = (shift_imm != 0);
 
     if (!s) {
-        // Chunk 1 (S=0): inline body, no flag emission.
+        // S=0: inline body. Chunk 1 (no-shift) or chunk 4 (shifted).
         switch (opc) {
             case 0x0: case 0x1: case 0x2: case 0x3: case 0x4:
             case 0xC: case 0xD: case 0xE: case 0xF:
-                return 1;
+                return shifted ? 3 : 1;
             default:
                 return 0;
         }
     }
-    // Chunk 3 (S=1): helper call for flag emission.
-    // TST/TEQ/CMP/CMN are always S=1 by encoding.
-    // ADDS/SUBS get S=1 from the assembler.
-    // ADC/SBC/RSC and ANDS/ORRS/EORS/BICS/MOVS/MVNS/RSBS are deferred.
+    // S=1: helper-call body. Chunk 3 (no-shift) or chunk 4 (shifted).
+    // Shifted TST/TEQ would need cout staging into arm_flag_c -- defer.
     switch (opc) {
         case 0x2:  // SUBS
         case 0x4:  // ADDS
-        case 0x8:  // TST
-        case 0x9:  // TEQ
         case 0xA:  // CMP
         case 0xB:  // CMN
-            return 2;
+            return shifted ? 4 : 2;
+        case 0x8:  // TST
+        case 0x9:  // TEQ
+            return shifted ? 0 : 2;
         default:
             return 0;
     }
