@@ -21,9 +21,11 @@ set(SOURCES
   src/io.c
   src/rom_buffer.c
   src/save_file.c
+  src/sh4_emit.c
   src/sh4_jit.c
   src/sound.c
   src/thumb_block.c
+  src/thumb_jit.c
   src/timer.c
   src/video.c
   # ...
@@ -111,6 +113,14 @@ if(GBA_FXLINK)
     target_compile_definitions(myaddin PRIVATE GBA_FXLINK=1)
 endif()
 message(STATUS "GBA_FXLINK = ${GBA_FXLINK}")
+
+# Phase 1 JIT: compile every Thumb block to native SH4 code. Off by
+# default so any regression can be A/B tested by toggling this alone.
+option(GBA_JIT_THUMB "JIT-compile Thumb basic blocks to native SH4" OFF)
+if(GBA_JIT_THUMB)
+    target_compile_definitions(myaddin PRIVATE GBA_JIT_THUMB=1)
+endif()
+message(STATUS "GBA_JIT_THUMB = ${GBA_JIT_THUMB}")
 
 # Link-time optimization: lets the linker inline across translation
 # units. Critical here because arm_read() in arm_mem.c calls

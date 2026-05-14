@@ -475,7 +475,7 @@ static inline void sh4_pref(const void *p) {
     __asm__ volatile ("pref @%0" : : "r" (p));
 }
 
-static void arm_load_pipe() {
+void arm_load_pipe(void) {
     // Detect return from an HLE'd IRQ before attempting any fetch. The
     // sentinel address is unmapped; calling arm_fetch_n at sentinel would
     // hit the slow path and return garbage. hle_irq_return restores the

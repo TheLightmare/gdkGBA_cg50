@@ -132,6 +132,7 @@ extern uint32_t arm_cycles;
 
 extern bool int_halt;
 extern bool pipe_reload;
+void arm_load_pipe(void);
 
 void arm_init();
 void arm_uninit();

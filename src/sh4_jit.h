@@ -55,6 +55,16 @@ uint16_t *jit_emit_begin(size_t budget_bytes);
 // responsible for honouring the budget passed to jit_emit_begin.
 void jit_emit16(uint16_t inst);
 
+// Current cursor (= address where the next emit would land). Used by
+// sh4_emit literal-pool fix-ups to remember the position of a
+// placeholder instruction for later patching.
+uint16_t *jit_cursor(void);
+
+// Rewind the cursor to `target`. Used by codegen to abandon a
+// partially-emitted block on failure. The caller must have obtained
+// `target` from an earlier jit_emit_begin() or jit_cursor() call.
+void jit_rewind(uint16_t *target);
+
 // Finalize the block: icbi every cache line spanning [start, cursor).
 // Returns the entry pointer cast to native_block_fn_t so the caller
 // can install it on a block_t. `start` is the value jit_emit_begin

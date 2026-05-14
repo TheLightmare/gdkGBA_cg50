@@ -6,8 +6,12 @@
 #include <gint/kmalloc.h>
 
 #include "arm_mem.h"      // rom_buffer, wram_chip, wram_board, ewram_mask
+#include "build_flags.h"
 #include "extram.h"
 #include "io.h"           // ws_s_t16
+#if GBA_JIT_THUMB
+#  include "thumb_jit.h"
+#endif
 #include "mem_swizzle.h"
 #include "rom_buffer.h"   // rom_buffer_read_16_fast
 
@@ -414,11 +418,20 @@ const thumb_block_t *thumb_block_decode(uint32_t inst_pc) {
     slot->generation   = thumb_block_current_gen;
     slot->page_idx     = page_idx;
     slot->page_gen     = page_gen;
-    // Phase 0: decoder never emits native code; leave the slot clear so
-    // the executor takes the interpreter path. Explicit because we may
-    // be overwriting an entry from a different PC that hashed here.
+    // Decoder default: NULL native_entry so the executor takes the
+    // interpreter path. Explicit because we may be overwriting an entry
+    // from a different PC that hashed here.
     slot->native_entry = NULL;
 
     thumb_uop_pool_head += length;
+
+#if GBA_JIT_THUMB
+    // Phase 1 Chunk 1: try to JIT-compile this block. On any failure
+    // (arena full, block too long for the literal-pool disp, etc.)
+    // native_entry stays NULL and the executor falls back to walking
+    // the uop list.
+    (void)thumb_jit_compile_block(slot);
+#endif
+
     return slot;
 }

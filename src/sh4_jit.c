@@ -60,6 +60,16 @@ void jit_emit16(uint16_t inst) {
     *jit_arena_cursor++ = inst;
 }
 
+uint16_t *jit_cursor(void) {
+    return jit_arena_cursor;
+}
+
+void jit_rewind(uint16_t *target) {
+    if (!jit_enabled) return;
+    if (target < jit_arena_base || target > jit_arena_end) return;
+    jit_arena_cursor = target;
+}
+
 native_block_fn_t jit_emit_end(uint16_t *start) {
     // icbi every cache line spanning [start, cursor). Round start down
     // and end up to line boundaries so any sub-line landing positions
