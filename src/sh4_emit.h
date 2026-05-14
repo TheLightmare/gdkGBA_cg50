@@ -80,12 +80,11 @@ void emit_bra (int16_t disp_insts);   // unconditional, delay slot follows
 // Returns false if the fixup table is full -- callers must check and
 // bail (typically by skipping codegen for an overly-large block).
 
-// Sized so that a max-length ARM block (64 uops) whose every uop hits
-// the chunk-4 worst case -- cond-checked + shifted + flag-update --
-// still fits. That uop uses 3 literals (cond_check addr, shifter addr,
-// flag-helper addr) so the upper bound is 64 * 3 = 192. Round up plus
-// headroom for block-level globals (pipe_reload, arm_load_pipe).
-#define SH4_LIT_POOL_MAX 256
+// Sized for the chunk-6 worst case: cond + data-proc imm S=1 logic uses
+//   cond_check addr + arm_flag_c addr + imm constant + helper addr = 4
+// literals per uop. A max-length 64-uop block can need 64 * 4 = 256
+// just for that. Round up plus headroom for block-level globals.
+#define SH4_LIT_POOL_MAX 384
 
 void emit_movl_pc_lit_reset(void);
 bool emit_movl_pc_lit(uint32_t value, uint8_t rn);

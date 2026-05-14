@@ -75,6 +75,10 @@ extern uint32_t arm_jit_bics(uint32_t lhs, uint32_t rhs);
 extern uint32_t arm_jit_movs(uint32_t lhs_unused, uint32_t rhs);
 extern uint32_t arm_jit_mvns(uint32_t lhs_unused, uint32_t rhs);
 
+// Phase 2 chunk 6: data-proc imm uses arm_flag_c directly for cout staging
+// (S=1 logic ops). arm_flag_c is a global defined in arm.c.
+extern uint32_t arm_flag_c;
+
 static size_t estimate_block_bytes(uint16_t length) {
     // Worst case per uop: cond-checked BL imm24 = 6 (cond prefix) +
     // 12 (body) = 18 SH4 instructions = 36 B + 3 literals = ~48 B.
@@ -576,6 +580,178 @@ static int arm_dp_reg_kind(uint32_t op) {
     }
 }
 
+// Phase 2 chunk 6: data-proc imm coverage. Group=001 ops route through
+// arm_dec_call_legacy (or one of the four decoder-specialised handlers
+// arm_dec_{add,sub,cmp,mov}_imm), all of which the JIT previously left
+// as JSR fallbacks except MOV imm. This chunk inlines all of them by
+// inspecting raw_op, exactly like chunks 1-5 did for data-proc REG.
+//
+// Decoder pre-rotates the 8-bit imm + 4-bit rot into uop->arg_c, so the
+// JIT just needs (Rn, Rd, opc, S) from raw_op and the rotated value from
+// arg_c. The cout for the imm rotation is bit 31 of the rotated value;
+// it's known at JIT time and matters only for S=1 logic ops, where the
+// JIT pre-writes arm_flag_c before calling the helper (which leaves C
+// alone in the post-helper state).
+//
+// kind:
+//   1 = S=0 inline body. Reuses the chunk-1 emit shape but with the imm
+//       value loaded into r1 via the literal pool instead of from memory.
+//   2 = S=1 arith helper-call (CMP/CMN/ADDS/SUBS imm). Same shape as
+//       chunk 3 but with imm in r5 via literal pool.
+//   3 = S=1 logic helper-call (TST/TEQ/ANDS/EORS/ORRS/BICS/MOVS/MVNS
+//       imm). Extra 3-instruction "*arm_flag_c = cout" pre-set ahead
+//       of the helper call.
+//
+// ADC/SBC/RSC imm are deferred (need C-flag input variants of the
+// helpers, same gap as chunk 5 left for the REG forms).
+
+static int arm_dp_imm_kind(uint32_t op) {
+    if (((op >> 25) & 0x7) != 1)  return 0;        // group 001
+    if (((op >> 12) & 0xF) == 15) return 0;        // Rd != 15
+
+    uint8_t opc = (op >> 21) & 0xF;
+    bool    s   = (op >> 20) & 0x1;
+
+    // Chunk 1 already inlines MOV imm S=0; leave that alone.
+    if (opc == 0xD && !s) return 0;
+
+    if (!s) {
+        switch (opc) {
+            case 0x0: case 0x1: case 0x2: case 0x3: case 0x4:
+            case 0xC: case 0xE: case 0xF:
+                return 1;
+            default:
+                return 0;  // ADC/SBC/RSC S=0 deferred
+        }
+    }
+    switch (opc) {
+        case 0x2:  // SUBS imm
+        case 0x4:  // ADDS imm
+        case 0xA:  // CMP imm
+        case 0xB:  // CMN imm
+            return 2;
+        case 0x0:  // ANDS imm
+        case 0x1:  // EORS imm
+        case 0x8:  // TST  imm
+        case 0x9:  // TEQ  imm
+        case 0xC:  // ORRS imm
+        case 0xD:  // MOVS imm
+        case 0xE:  // BICS imm
+        case 0xF:  // MVNS imm
+            return 3;
+        default:
+            return 0;  // ADC/SBC/RSC S=1 deferred
+    }
+}
+
+// Body sizes for the bt-skip displacement of the cond-checked variant.
+// Sizes count SH4 instructions in the body (no prefix, no bt).
+static int emit_arm_dp_imm_size(uint8_t opc, int kind) {
+    if (kind == 1) {
+        switch (opc) {
+            case 0xF: return 3;                 // MVN imm: load ~imm, store
+            case 0xE: return 5;                 // BIC: load Rn, load imm, not, and, store
+            default:  return 4;                 // AND/EOR/SUB/RSB/ADD/ORR imm
+        }
+    }
+    if (kind == 2) {
+        // CMP/CMN no store; ADDS/SUBS add a final mov.l r0, @(rd, r8).
+        return opc_writes_dest_s1(opc) ? 6 : 5;
+    }
+    // kind 3: 3-inst cout pre-set + helper call (5) + optional store.
+    return 3 + (opc_writes_dest_s1(opc) ? 6 : 5);
+}
+
+// kind 1: S=0 inline body. r0 = Rn (or unused for MVN), r1 = imm.
+static bool emit_arm_dp_imm_s0_body(uint8_t opc, uint8_t rn, uint8_t rd, uint32_t imm) {
+    if (opc == 0xF) {                              // MVN imm: Rd = ~imm
+        if (!emit_movl_pc_lit(~imm, 0)) return false;
+        emit_movl_rm_disp_rn(0, rd, 8);
+        return true;
+    }
+    emit_movl_disp_rm_rn(rn, 8, 0);                // r0 = Rn
+    if (!emit_movl_pc_lit(imm, 1)) return false;   // r1 = imm
+    switch (opc) {
+        case 0x0: emit_and_rr(1, 0); break;        // AND
+        case 0x1: emit_xor_rr(1, 0); break;        // EOR
+        case 0x2: emit_sub_rr(1, 0); break;        // SUB
+        case 0x3:                                   // RSB: imm - Rn
+            emit_sub_rr(0, 1);                      // r1 -= r0
+            emit_movl_rm_disp_rn(1, rd, 8);
+            return true;
+        case 0x4: emit_add_rr(1, 0); break;        // ADD
+        case 0xC: emit_or_rr (1, 0); break;        // ORR
+        case 0xE:                                   // BIC: Rn & ~imm
+            emit_not_rr(1, 1);                      // r1 = ~imm
+            emit_and_rr(1, 0);                      // r0 &= r1
+            break;
+        default: return false;
+    }
+    emit_movl_rm_disp_rn(0, rd, 8);
+    return true;
+}
+
+// kind 2: S=1 arith helper-call. r4 = Rn, r5 = imm.
+static bool emit_arm_dp_imm_s1_arith_body(uint8_t opc, uint8_t rn, uint8_t rd, uint32_t imm) {
+    void *helper = arm_dp_reg_s1_helper(opc);
+    if (!helper) return false;
+    emit_movl_disp_rm_rn(rn, 8, 4);                            // r4 = Rn
+    if (!emit_movl_pc_lit(imm, 5)) return false;               // r5 = imm
+    if (!emit_movl_pc_lit((uint32_t)(uintptr_t)helper, 0))     // r0 = &helper
+        return false;
+    emit_jsr_at_rn(0);
+    emit_nop();
+    if (opc_writes_dest_s1(opc)) {
+        emit_movl_rm_disp_rn(0, rd, 8);
+    }
+    return true;
+}
+
+// kind 3: S=1 logic helper-call with cout pre-set.
+//   r1 = &arm_flag_c ; r0 = cout (constant 0 or 1) ; mov.l r0, @r1
+// followed by the same shape as kind 2.
+static bool emit_arm_dp_imm_s1_logic_body(uint8_t opc, uint8_t rn, uint8_t rd, uint32_t imm) {
+    void *helper = arm_dp_reg_s1_helper(opc);
+    if (!helper) return false;
+    uint8_t cout = (uint8_t)((imm >> 31) & 1u);
+
+    // Stash cout into arm_flag_c so the helper (which doesn't touch C)
+    // leaves the right state for subsequent ops.
+    emit_mov_imm_rn((int8_t)cout, 0);
+    if (!emit_movl_pc_lit((uint32_t)(uintptr_t)&arm_flag_c, 1)) return false;
+    emit_movl_rm_disp_rn(0, 0, 1);                              // mov.l r0, @r1
+
+    emit_movl_disp_rm_rn(rn, 8, 4);                            // r4 = Rn
+    if (!emit_movl_pc_lit(imm, 5)) return false;               // r5 = imm
+    if (!emit_movl_pc_lit((uint32_t)(uintptr_t)helper, 0))     // r0 = &helper
+        return false;
+    emit_jsr_at_rn(0);
+    emit_nop();
+    if (opc_writes_dest_s1(opc)) {
+        emit_movl_rm_disp_rn(0, rd, 8);
+    }
+    return true;
+}
+
+static bool emit_arm_dp_imm(uint8_t cond, uint32_t op, int kind, uint32_t imm) {
+    uint8_t opc = (op >> 21) & 0xF;
+    uint8_t rn  = (op >> 16) & 0xF;
+    uint8_t rd  = (op >> 12) & 0xF;
+
+    int body_size = emit_arm_dp_imm_size(opc, kind);
+
+    if (cond != 14) {
+        if (!emit_arm_cond_check_prefix(cond)) return false;
+        emit_bt((int16_t)(body_size - 1));
+    }
+    switch (kind) {
+        case 1: return emit_arm_dp_imm_s0_body       (opc, rn, rd, imm);
+        case 2: return emit_arm_dp_imm_s1_arith_body (opc, rn, rd, imm);
+        case 3: return emit_arm_dp_imm_s1_logic_body (opc, rn, rd, imm);
+        default: return false;
+    }
+}
+
 // Dispatch one uop. Returns SPECIALISED, FALLBACK_OK, or FAIL.
 enum emit_result { EMIT_SPECIALISED, EMIT_FALLBACK, EMIT_FAIL };
 
@@ -596,6 +772,19 @@ static enum emit_result arm_emit_one_uop(const arm_uop_t *uop) {
     if (uop->handler == arm_dec_mov_imm) {
         if (!emit_arm_mov_imm(uop->cond, uop->arg_b, uop->arg_c)) return EMIT_FAIL;
         return EMIT_SPECIALISED;
+    }
+    // Phase 2 chunk 6: data-proc imm. arm_dp_imm_kind keys on raw_op so
+    // it catches both the unspecialised legacy ops (handler ==
+    // arm_dec_call_legacy) and the decoder-specialised handlers (ADD/SUB
+    // /CMP imm) we previously left as JSR fallbacks. The pre-rotated
+    // 32-bit imm lives in uop->arg_c.
+    {
+        int kind = arm_dp_imm_kind(uop->raw_op);
+        if (kind) {
+            if (!emit_arm_dp_imm(uop->cond, uop->raw_op, kind, uop->arg_c))
+                return EMIT_FAIL;
+            return EMIT_SPECIALISED;
+        }
     }
     // Phase 2 chunks 1 & 3: JIT-only recognition of data-proc REG
     // (no-shift). The interpreter routes these through
