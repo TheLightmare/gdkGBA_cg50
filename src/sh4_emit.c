@@ -85,6 +85,16 @@ void emit_tst_rr(uint8_t rm, uint8_t rn) {
     jit_emit16((uint16_t)(0x2008 | (R(rn) << 8) | (R(rm) << 4)));
 }
 
+void emit_shll2(uint8_t rn) {
+    // shll2 Rn   :   0100 nnnn 0000 1000    (Rn <<= 2 ; T = old MSB-1)
+    jit_emit16((uint16_t)(0x4008 | (R(rn) << 8)));
+}
+
+void emit_shlr2(uint8_t rn) {
+    // shlr2 Rn   :   0100 nnnn 0000 1001    (Rn >>= 2 logical ; T = old bit 1)
+    jit_emit16((uint16_t)(0x4009 | (R(rn) << 8)));
+}
+
 // ----- Control flow --------------------------------------------------------
 
 void emit_jsr_at_rn(uint8_t rn) {

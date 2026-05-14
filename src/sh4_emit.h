@@ -46,6 +46,10 @@ void emit_add_imm_rn(int8_t imm, uint8_t rn);       // add #imm, Rn   (signed 8)
 void emit_add_rr    (uint8_t rm, uint8_t rn);        // add Rm, Rn     (reg+reg, no flags)
 void emit_tst_rr    (uint8_t rm, uint8_t rn);        // tst Rm, Rn
 
+// Shifts (T flag set to outgoing bit; we ignore T for these uses).
+void emit_shll2     (uint8_t rn);                    // shll2 Rn -- Rn <<= 2
+void emit_shlr2     (uint8_t rn);                    // shlr2 Rn -- Rn >>= 2 (logical)
+
 // ----- Control flow --------------------------------------------------------
 
 void emit_jsr_at_rn(uint8_t rn);   // jsr @Rn -- delay slot follows

@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "arm.h"            // pipe_reload, arm_load_pipe
+#include "arm_mem.h"        // arm_read, arm_write
 #include "bench.h"
 #include "build_flags.h"
 #include "sh4_emit.h"
@@ -49,6 +50,9 @@ extern bool int_halt;
 extern void t16_dec_mov_imm8(const thumb_uop_t *uop);
 extern void t16_dec_b_imm11(const thumb_uop_t *uop);
 extern void t16_dec_b_cond (const thumb_uop_t *uop);
+extern void t16_dec_ldr_imm5(const thumb_uop_t *uop);
+extern void t16_dec_str_imm5(const thumb_uop_t *uop);
+extern void t16_dec_ldr_pc8 (const thumb_uop_t *uop);
 
 // ----- Internal helpers ----------------------------------------------------
 
@@ -190,6 +194,57 @@ static bool emit_thumb_b_cond(uint8_t cond, int32_t imm) {
     return true;
 }
 
+// Thumb LDR Rd, [Rn, #imm5*4] (arg_a = Rd, arg_b = Rn, arg_c = imm5*4).
+// imm5*4 maxes at 124, fits SH4 add #imm. arm_read returns the loaded
+// word in r0. 7 SH4 instructions + 1 literal.
+static bool emit_thumb_ldr_imm5(uint8_t rd, uint8_t rn, uint16_t imm) {
+    emit_movl_disp_rm_rn((uint8_t)(rn & 0xF), 8, 0);        // r0 = arm_r.r[Rn]
+    emit_add_imm_rn((int8_t)imm, 0);                         // r0 += imm
+    emit_mov_rr(0, 4);                                       // r4 = r0 (address)
+    if (!emit_movl_pc_lit((uint32_t)(uintptr_t)&arm_read, 0)) return false;
+    emit_jsr_at_rn(0);
+    emit_nop();
+    emit_movl_rm_disp_rn(0, (uint8_t)(rd & 0xF), 8);         // arm_r.r[Rd] = r0
+    return true;
+}
+
+// Thumb STR Rd, [Rn, #imm5*4] (arg_a = Rt, arg_b = Rn, arg_c = imm5*4).
+// arm_write takes (addr, value) in r4/r5; no return value. 7 SH4
+// instructions + 1 literal.
+static bool emit_thumb_str_imm5(uint8_t rt, uint8_t rn, uint16_t imm) {
+    emit_movl_disp_rm_rn((uint8_t)(rn & 0xF), 8, 0);        // r0 = arm_r.r[Rn]
+    emit_add_imm_rn((int8_t)imm, 0);                         // r0 += imm
+    emit_mov_rr(0, 4);                                       // r4 = r0 (address)
+    emit_movl_disp_rm_rn((uint8_t)(rt & 0xF), 8, 5);        // r5 = arm_r.r[Rt]
+    if (!emit_movl_pc_lit((uint32_t)(uintptr_t)&arm_write, 0)) return false;
+    emit_jsr_at_rn(0);
+    emit_nop();
+    return true;
+}
+
+// Thumb LDR Rd, [PC, #imm8*4] (arg_a = Rd, arg_c = imm8*4 in 0..1020).
+// Address = (arm_r.r[15] & ~3) + imm. R15 here is the interpreter's
+// usual "inst_pc + 4" -- the JIT increments R15 between uops, so by the
+// time this body runs, R15 already reflects the right per-instruction
+// value. 9-11 SH4 instructions + 1-2 literals depending on imm range.
+static bool emit_thumb_ldr_pc8(uint8_t rd, uint16_t imm) {
+    emit_movl_disp_rm_rn(15, 8, 0);     // r0 = arm_r.r[15]
+    emit_shlr2(0);                      // clear low 2 bits via >>2 then <<2
+    emit_shll2(0);
+    if (imm <= 127u) {
+        emit_add_imm_rn((int8_t)imm, 0);                     // r0 += imm
+    } else {
+        if (!emit_movl_pc_lit((uint32_t)imm, 1)) return false;
+        emit_add_rr(1, 0);                                   // r0 += r1
+    }
+    emit_mov_rr(0, 4);                                       // r4 = r0 (address)
+    if (!emit_movl_pc_lit((uint32_t)(uintptr_t)&arm_read, 0)) return false;
+    emit_jsr_at_rn(0);
+    emit_nop();
+    emit_movl_rm_disp_rn(0, (uint8_t)(rd & 0xF), 8);         // arm_r.r[Rd] = r0
+    return true;
+}
+
 // Dispatch one uop. Returns SPECIALISED, FALLBACK_OK, or FAIL.
 enum emit_result { EMIT_SPECIALISED, EMIT_FALLBACK, EMIT_FAIL };
 
@@ -209,6 +264,18 @@ static enum emit_result emit_one_uop(const thumb_uop_t *uop) {
             if (!emit_jsr_fallback(uop)) return EMIT_FAIL;
             return EMIT_FALLBACK;
         }
+        return EMIT_SPECIALISED;
+    }
+    if (uop->handler == t16_dec_ldr_imm5) {
+        if (!emit_thumb_ldr_imm5(uop->arg_a, uop->arg_b, uop->arg_c)) return EMIT_FAIL;
+        return EMIT_SPECIALISED;
+    }
+    if (uop->handler == t16_dec_str_imm5) {
+        if (!emit_thumb_str_imm5(uop->arg_a, uop->arg_b, uop->arg_c)) return EMIT_FAIL;
+        return EMIT_SPECIALISED;
+    }
+    if (uop->handler == t16_dec_ldr_pc8) {
+        if (!emit_thumb_ldr_pc8(uop->arg_a, uop->arg_c)) return EMIT_FAIL;
         return EMIT_SPECIALISED;
     }
     if (!emit_jsr_fallback(uop)) return EMIT_FAIL;
