@@ -415,18 +415,38 @@ int main(void) {
     // first cart fetch). Dump a small bounded range around the address where
     // the cart is known to spin, so we can decode the loop. Small enough not
     // to thrash the chunk cache.
+    //
+    // Build the entire dump string in a stack buffer and write it via one
+    // world-switched fwrite. Two problems we're avoiding:
+    //   1. arm_readb on cart can trigger a chunk-load gint_world_switch;
+    //      doing that while a stdio FILE* is open races against the file
+    //      handle's gint-world state. So we pre-snapshot the bytes.
+    //   2. fprintf-by-piece on a fragmented log file panics under stdio
+    //      buffer flush in gint world (confirmed by repeated mid-line
+    //      log truncation). One snprintf+fwrite is the safe pattern.
     {
-        FILE *log = fopen("fxgba_log.txt", "a");
-        if (log) {
-            fprintf(log, "Cart 0x08040BE0..0x08040C20:\n");
-            for (int i = 0; i < 0x40; i++) {
-                if (i % 16 == 0) fprintf(log, "%08X:", 0x08040BE0 + i);
-                fprintf(log, " %02X", arm_readb(0x08040BE0 + i));
-                if (i % 16 == 15) fprintf(log, "\n");
-            }
-            fprintf(log, "\n");
-            fclose(log);
+        uint8_t cart_bytes[0x40];
+        for (int i = 0; i < 0x40; i++) {
+            cart_bytes[i] = arm_readb(0x08040BE0 + i);
         }
+        char     cart_buf[512];
+        size_t   cn = 0;
+        cn = safe_append(cart_buf, sizeof(cart_buf), cn,
+                         "Cart 0x08040BE0..0x08040C20:\n");
+        for (int i = 0; i < 0x40; i++) {
+            if (i % 16 == 0) {
+                cn = safe_append(cart_buf, sizeof(cart_buf), cn,
+                                 "%08X:", 0x08040BE0 + i);
+            }
+            cn = safe_append(cart_buf, sizeof(cart_buf), cn,
+                             " %02X", cart_bytes[i]);
+            if (i % 16 == 15) {
+                cn = safe_append(cart_buf, sizeof(cart_buf), cn, "\n");
+            }
+        }
+        cn = safe_append(cart_buf, sizeof(cart_buf), cn, "\n");
+        struct snap_log_args sla = { .buf = cart_buf, .bytes = cn };
+        gint_world_switch(GINT_CALL(do_snap_log_append, (void *)&sla));
     }
 #endif // GBA_DIAG_LOG
 
