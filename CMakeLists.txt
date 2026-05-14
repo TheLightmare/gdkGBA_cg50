@@ -11,6 +11,7 @@ find_package(Gint 2.9 REQUIRED)
 
 set(SOURCES
   src/main.c
+  src/arm_block.c
   src/arm_mem.c
   src/arm.c
   src/bench.c
@@ -115,6 +116,7 @@ set_source_files_properties(
     PROPERTIES COMPILE_FLAGS "-O3 -fno-strict-aliasing"
 )
 set_source_files_properties(
+    src/arm_block.c
     src/arm_mem.c
     src/rom_buffer.c
     src/thumb_block.c

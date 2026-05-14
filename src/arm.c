@@ -4,8 +4,10 @@
 #include <gint/defs/attributes.h>
 
 #include "arm.h"
+#include "arm_block.h"
 #include "arm_mem.h"
 #include "arm_shared.h"
+#include "bench.h"
 #include "build_flags.h"
 #include "mem_swizzle.h"
 #include "thumb_block.h"
@@ -188,6 +190,13 @@ static void arm_mode_set(int8_t mode) {
 static inline bool arm_flag_tst(uint32_t flag) {
     return arm_r.cpsr & flag;
 }
+
+// "Unconditional" cond field encoding -- used by a handful of ARMv5+
+// instructions (BLX-imm, PLD, CDP2, etc.) that pre-dated the cond=14
+// "always" idiom. Defined here (hoisted from the legacy dispatch site
+// further down) so the ARM block-cache micro-op handlers can reference
+// it.
+#define ARM_COND_UNCOND  0b1111
 
 static inline bool arm_cond(int8_t cond) {
     bool res;
@@ -3911,6 +3920,132 @@ void t16_dec_call_legacy(const thumb_uop_t *uop) {
     thumb_proc[uop->raw_op >> 5]();
 }
 
+// --- ARM-mode block-cache micro-op handlers --------------------------------
+//
+// Mirrors the t16_dec_* family but for ARM. Every handler is responsible
+// for its own cond check; cond==14 (AL) short-circuits the arm_cond call.
+// cond==15 (UNCOND) and any opcode the decoder declined to specialise
+// route through arm_dec_call_legacy.
+//
+// Cond evaluation up front:
+//   * cond == 14: always run (do not call arm_cond)
+//   * cond == 15: UNCOND -- only arm_dec_call_legacy ever sees this
+//   * else: arm_cond(cond); if false, count + return
+static inline bool arm_uop_cond_passes(uint8_t cond) {
+    if (cond == 14) return true;
+    if (arm_cond(cond)) return true;
+    BENCH_INC(bench_arm_cond_skip);
+    return false;
+}
+
+// Universal fallback. Sets arm_op and dispatches through the legacy
+// proc-handler table -- behaviour identical to arm_step minus the
+// per-instruction fetch+decode work the executor already amortised.
+void arm_dec_call_legacy(const arm_uop_t *uop) {
+    BENCH_INC(bench_arm_legacy_inst);
+    BENCH_INC(bench_arm_legacy_hist[(uop->raw_op >> 24) & 0xF]);
+    uint8_t cond = uop->cond;
+    arm_op = uop->raw_op;
+    uint32_t proc = ((uop->raw_op >> 16) & 0xff0) | ((uop->raw_op >> 4) & 0x00f);
+    if (cond == 14) {
+        arm_proc_handlers[arm_proc_idx_0[proc]]();
+    } else if (cond == ARM_COND_UNCOND) {
+        arm_proc_handlers[arm_proc_idx_1[proc]]();
+    } else if (arm_cond(cond)) {
+        arm_proc_handlers[arm_proc_idx_0[proc]]();
+    } else {
+        BENCH_INC(bench_arm_cond_skip);
+    }
+}
+
+// B #imm24 -- unconditional branch (cond may still gate it). arg_c is
+// the sign-extended (imm24 << 2) byte offset; the +8 pipeline offset
+// is already baked into R15 at handler entry.
+void arm_dec_b_imm24(const arm_uop_t *uop) {
+    if (!arm_uop_cond_passes(uop->cond)) return;
+    arm_r.r[15] += (int32_t)uop->arg_c;
+    arm_r15_align();
+    arm_load_pipe();
+}
+
+// BL #imm24 -- same as B but saves the return address into LR. LR
+// must equal "instruction PC + 4" = (R15 - 8) + 4 = R15 - 4.
+void arm_dec_bl_imm24(const arm_uop_t *uop) {
+    if (!arm_uop_cond_passes(uop->cond)) return;
+    arm_r.r[14] = arm_r.r[15] - 4u;
+    arm_r.r[15] += (int32_t)uop->arg_c;
+    arm_r15_align();
+    arm_load_pipe();
+}
+
+// MOV Rd, #imm  (no S-bit) -- arg_a=Rn (unused), arg_b=Rd, arg_c=imm.
+// Decoder gates Rd==15 to legacy, so PC writes are not possible here.
+void arm_dec_mov_imm(const arm_uop_t *uop) {
+    if (!arm_uop_cond_passes(uop->cond)) return;
+    arm_r.r[uop->arg_b] = uop->arg_c;
+}
+
+// ADDS Rd, Rn, #imm
+void arm_dec_add_imm(const arm_uop_t *uop) {
+    if (!arm_uop_cond_passes(uop->cond)) return;
+    arm_data_t op = {
+        .rd   = uop->arg_b,
+        .lhs  = arm_r.r[uop->arg_a],
+        .rhs  = uop->arg_c,
+        .cout = false,
+        .s    = true,
+    };
+    arm_arith_add(op, ARM_ARITH_NO_C);
+}
+
+// SUBS Rd, Rn, #imm
+void arm_dec_sub_imm(const arm_uop_t *uop) {
+    if (!arm_uop_cond_passes(uop->cond)) return;
+    arm_data_t op = {
+        .rd   = uop->arg_b,
+        .lhs  = arm_r.r[uop->arg_a],
+        .rhs  = uop->arg_c,
+        .cout = false,
+        .s    = true,
+    };
+    arm_arith_sub(op);
+}
+
+// CMP Rn, #imm
+void arm_dec_cmp_imm(const arm_uop_t *uop) {
+    if (!arm_uop_cond_passes(uop->cond)) return;
+    arm_data_t op = {
+        .rd   = uop->arg_b,     // unused for CMP, but the field is there
+        .lhs  = arm_r.r[uop->arg_a],
+        .rhs  = uop->arg_c,
+        .cout = false,
+        .s    = true,
+    };
+    arm_arith_cmp(op);
+}
+
+// LDR Rt, [Rn, #±imm12]  (pre-index, no writeback, word-aligned).
+// arg_a=Rt, arg_b=Rn, arg_c=signed offset (already encoded).
+// Rt==15 and Rn==15 are both gated to legacy at decode time.
+void arm_dec_ldr_imm12(const arm_uop_t *uop) {
+    if (!arm_uop_cond_passes(uop->cond)) return;
+    arm_memio_t op = {
+        .rt   = uop->arg_a,
+        .addr = arm_r.r[uop->arg_b] + (int32_t)uop->arg_c,
+    };
+    arm_memio_ldr(op);
+}
+
+// STR Rt, [Rn, #±imm12]  (same shape as LDR).
+void arm_dec_str_imm12(const arm_uop_t *uop) {
+    if (!arm_uop_cond_passes(uop->cond)) return;
+    arm_memio_t op = {
+        .rt   = uop->arg_a,
+        .addr = arm_r.r[uop->arg_b] + (int32_t)uop->arg_c,
+    };
+    arm_memio_str(op);
+}
+
 void arm_init() {
     // Initialize memory buffer contents, not the pointers themselves
     // as they are already declared as arrays
@@ -3954,8 +4089,6 @@ void arm_uninit() {
     free(sram);
     free(flash);
 }
-
-#define ARM_COND_UNCOND  0b1111
 
 static inline void t16_inc_r15() {
     if (pipe_reload)
@@ -4031,6 +4164,8 @@ static inline void arm_step() {
         arm_proc_handlers[arm_proc_idx_1[proc]]();
     } else if (arm_cond(cond)) {
         arm_proc_handlers[arm_proc_idx_0[proc]]();
+    } else {
+        BENCH_INC(bench_arm_cond_skip);
     }
 
     arm_inc_r15();
@@ -4071,7 +4206,18 @@ volatile uint8_t  arm_swi_last;
 // gint_set_onchip_save_mode(BACKUP) in main.c covers the entire ILRAM
 // region across world switches, so chunk-load fread can still happen
 // without trashing the dispatch code.
+//
+// Bench builds: the per-mode timing brackets, per-instruction BENCH_INC
+// calls, and block-decode counter push the inlined body past the 4 KB
+// budget. Drop the ILRAM placement so the link succeeds. The bench
+// numbers come out a bit pessimistic vs. release (no ILRAM benefit) but
+// the *ratios* we use them for -- ARM vs Thumb split, block coverage,
+// cond_skip rate -- are unaffected.
+#if GBA_BENCH
+#define ILRAM_CODE
+#else
 #define ILRAM_CODE __attribute__((section(".gint.mapped")))
+#endif
 void arm_exec(uint32_t target_cycles) ILRAM_CODE;
 void arm_exec(uint32_t target_cycles) {
     if (int_halt) {
@@ -4102,6 +4248,9 @@ void arm_exec(uint32_t target_cycles) {
     // overwhelming common case in any game's hot loop).
     while (arm_cycles < target_cycles) {
         if (arm_in_thumb()) {
+#if GBA_BENCH
+            uint32_t _bench_thumb_t0 = bench_now();
+#endif
             do {
                 // Block-cache fast path. arm_r.r[15] holds the prefetched
                 // PC (instruction PC + 4 in Thumb), so the actual
@@ -4111,7 +4260,10 @@ void arm_exec(uint32_t target_cycles) {
                 {
                     uint32_t inst_pc = arm_r.r[15] - 4u;
                     const thumb_block_t *b = thumb_block_lookup(inst_pc);
-                    if (!b) b = thumb_block_decode(inst_pc);
+                    if (!b) {
+                        BENCH_INC(bench_thumb_block_decodes);
+                        b = thumb_block_decode(inst_pc);
+                    }
                     if (b) {
                         const thumb_uop_t *ops =
                             thumb_uop_pool + b->ops_offset;
@@ -4133,6 +4285,9 @@ void arm_exec(uint32_t target_cycles) {
                             if (pipe_reload) break;     // branch exit
                             arm_r.r[15] += 2;
                         }
+#if GBA_BENCH
+                        bench_thumb_block_inst += i;
+#endif
                         if (i == b->length) {
                             // Sequential exit: pipe is stale (we never
                             // fetched during the block). arm_load_pipe
@@ -4155,7 +4310,7 @@ void arm_exec(uint32_t target_cycles) {
                         pipe_reload = false;
                         if (int_halt) {
                             arm_cycles = target_cycles;
-                            goto done;
+                            break;
                         }
                         continue;
                     }
@@ -4175,14 +4330,63 @@ void arm_exec(uint32_t target_cycles) {
 #endif
 
                 t16_step();
+                BENCH_INC(bench_thumb_ss_inst);
 
                 if (int_halt) {
                     arm_cycles = target_cycles;
-                    goto done;
+                    break;
                 }
             } while (arm_cycles < target_cycles && arm_in_thumb());
+#if GBA_BENCH
+            bench_thumb_mode_ticks += bench_elapsed(_bench_thumb_t0);
+#endif
         } else {
+#if GBA_BENCH
+            uint32_t _bench_arm_t0 = bench_now();
+#endif
             do {
+                // ARM block-cache fast path. R15 = inst_pc + 8 (two-stage
+                // prefetch); the block stores instructions starting at
+                // inst_pc and the executor increments by 4 per uop.
+                {
+                    uint32_t inst_pc = arm_r.r[15] - 8u;
+                    const arm_block_t *b = arm_block_lookup(inst_pc);
+                    if (!b) {
+                        BENCH_INC(bench_arm_block_decodes);
+                        b = arm_block_decode(inst_pc);
+                    }
+                    if (b) {
+                        const arm_uop_t *ops =
+                            arm_uop_pool + b->ops_offset;
+                        arm_cycles += b->total_cycles;
+                        pipe_reload = false;
+                        uint16_t i;
+                        for (i = 0; i < b->length; i++) {
+                            ops[i].handler(&ops[i]);
+                            if (pipe_reload) break;
+                            arm_r.r[15] += 4;
+                        }
+#if GBA_BENCH
+                        bench_arm_block_inst += i;
+#endif
+                        if (i == b->length) {
+                            // Sequential exit: step R15 back by 8 so
+                            // arm_load_pipe re-fetches starting at the
+                            // first post-block instruction.
+                            arm_r.r[15] -= 8u;
+                            arm_load_pipe();
+                        }
+                        pipe_reload = false;
+                        if (int_halt) {
+                            arm_cycles = target_cycles;
+                            break;
+                        }
+                        continue;
+                    }
+                }
+
+                // Single-step fallback (RAM-resident ARM when the cache
+                // is disabled, or any case the block path declined).
                 arm_op      = arm_pipe[0];
                 arm_pipe[0] = arm_pipe[1];
 
@@ -4194,15 +4398,18 @@ void arm_exec(uint32_t target_cycles) {
 #endif
 
                 arm_step();
+                BENCH_INC(bench_arm_ss_inst);
 
                 if (int_halt) {
                     arm_cycles = target_cycles;
-                    goto done;
+                    break;
                 }
             } while (arm_cycles < target_cycles && !arm_in_thumb());
+#if GBA_BENCH
+            bench_arm_mode_ticks += bench_elapsed(_bench_arm_t0);
+#endif
         }
     }
-done:
 
     if (tmr_enb) timers_clock(arm_cycles - start_cycles);
     arm_cycles -= target_cycles;

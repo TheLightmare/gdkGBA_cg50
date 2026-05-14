@@ -7,12 +7,10 @@
 #include "io.h"
 
 #include <gint/display.h>
-#include <gint/kmalloc.h>
 #if GBA_FXLINK
 #include <gint/usb.h>
 #include <gint/usb-ff-bulk.h>
 #endif
-#include "extram.h"
 #include "gint_gba.h"
 #include "video.h"
 
@@ -32,53 +30,55 @@
 // "Fit to calculator screen" 7/5 upscale state. See video.h for the
 // public contract. Dest region is 336x224 centered horizontally; each
 // dest pixel reads one source pixel via a precomputed nearest-source
-// LUT. The source is backed up to fit_source_backup before the
-// scale-blit overwrites it (the 336x224 dest fully contains the
-// 240x160 source location in gint_vram, so an in-place expansion is
-// not possible without buffering).
+// LUT.
+//
+// Aliasing: the 336x224 dest fully contains the 240x160 source location
+// in gint_vram, so an in-place expansion is not possible. We work
+// around it by snapshotting the *current* source row into XYRAM
+// (line_buf, free at this point since render_line() has finished)
+// before each dest row is written -- 480 bytes in / 672 bytes out per
+// dest row, both sequential. Previously we did a one-shot 76 KB backup
+// into extram; the streamed version eliminates that buffer entirely
+// and roughly halves the per-frame fit-mode bus traffic.
 #define FIT_W         336
 #define FIT_H         224
 #define FIT_X_OFFSET  ((CG_SCREEN_W - FIT_W) / 2)  // 30
 
 bool gba_fit_to_screen = false;
-static uint16_t *fit_source_backup = NULL;
-static uint8_t   fit_src_col[FIT_W];   // dest col -> source col 0..239
-static uint8_t   fit_src_row[FIT_H];   // dest row -> source row 0..159
+static uint8_t fit_src_col[FIT_W];   // dest col -> source col 0..239
+static uint8_t fit_src_row[FIT_H];   // dest row -> source row 0..159
 
 void gba_fit_init(void) {
     for (int dc = 0; dc < FIT_W; dc++) fit_src_col[dc] = (uint8_t)((dc * 5) / 7);
     for (int dr = 0; dr < FIT_H; dr++) fit_src_row[dr] = (uint8_t)((dr * 5) / 7);
-
-    if (fit_source_backup) return;
-    // Prefer extram (3 MB arena); fall back to the standard heap if
-    // extram isn't available on this OS. On total allocation failure
-    // gba_fit_to_screen toggles will be no-ops in scale_blit_to_screen.
-    if (extram_available) {
-        fit_source_backup = (uint16_t *)kmalloc(240 * 160 * 2, "extram");
-        if (fit_source_backup) return;
-    }
-    fit_source_backup = (uint16_t *)kmalloc(240 * 160 * 2, "_uram");
 }
 
+// Per-scanline rasterisation buffer in XYRAM. All BG/OBJ writes, blend
+// read-modify-writes, and the per-line backdrop/forced-blank fills hit
+// this 480-byte buffer instead of the wide gint_vram framebuffer in
+// main RAM. End of render_line() flushes it as a single sequential
+// memcpy to the centered 240x160 region of gint_vram, turning scattered
+// RMW into one streaming write. Cuts main-RAM bus traffic dramatically
+// on blend-heavy scenes (windows / alpha / brightness modes).
+//
+// Also reused as the per-row source snapshot in scale_blit_to_screen()
+// since fit-mode runs after render_line() has flushed for the frame.
+static uint16_t line_buf[240] GXRAM;
+
 static void scale_blit_to_screen(void) {
-    if (!fit_source_backup) return;
-
-    // Snapshot the centered 240x160 source region. Each source row is
-    // 480 bytes contiguous in gint_vram, so memcpy is enough.
-    for (int sy = 0; sy < 160; sy++) {
-        const uint16_t *src = gint_vram
-            + (sy + GBA_Y_OFFSET) * CG_SCREEN_W + GBA_X_OFFSET;
-        memcpy(fit_source_backup + sy * 240, src, 240 * 2);
-    }
-
-    // Scale-blit into the 336x224 region. Pull the source-row pointer
-    // out of the per-pixel loop; per-pixel work is one LUT load and
-    // one indirect read.
     for (int dr = 0; dr < FIT_H; dr++) {
-        const uint16_t *src_row = fit_source_backup + fit_src_row[dr] * 240;
+        // Snapshot the source row into XYRAM. Reading + writing
+        // straight from/to gint_vram would alias for dr=112 (the row
+        // where dr == fit_src_row[dr] + GBA_Y_OFFSET), and is also
+        // worse for cache locality across the 7/5 stretch.
+        const uint16_t *gba_src = gint_vram
+            + (fit_src_row[dr] + GBA_Y_OFFSET) * CG_SCREEN_W
+            + GBA_X_OFFSET;
+        memcpy(line_buf, gba_src, 240 * sizeof(uint16_t));
+
         uint16_t *dst_row = gint_vram + dr * CG_SCREEN_W + FIT_X_OFFSET;
         for (int dc = 0; dc < FIT_W; dc++) {
-            dst_row[dc] = src_row[fit_src_col[dc]];
+            dst_row[dc] = line_buf[fit_src_col[dc]];
         }
     }
 }
@@ -89,8 +89,6 @@ static void scale_blit_to_screen(void) {
 #define CYC_LINE_TOTAL  1232
 #define CYC_LINE_HBLK0  1006
 #define CYC_LINE_HBLK1  (CYC_LINE_TOTAL - CYC_LINE_HBLK0)
-
-void *screen;
 
 #if GBA_FXLINK
 // fxlink frame push, mirroring the canonical pattern from
@@ -176,7 +174,7 @@ static bool    windows_active;
 #define LAYER_OBJ  4
 #define LAYER_BD   5
 #define LAYER_BIT(L)  (1u << (L))
-static uint8_t layer_id_buf[240];
+static uint8_t layer_id_buf[240] GXRAM;
 
 // Blend state, refreshed at the start of each scanline from BLDCNT /
 // BLDALPHA / BLDY. Cached in scanline-local statics so the per-pixel
@@ -290,36 +288,35 @@ static inline uint16_t blend_apply(uint16_t src, uint8_t src_layer,
 // layer_id_buf consistent and apply BLDCNT when applicable. The
 // blend_any short-circuit means the only added cost on a no-blend
 // scanline is one byte store per pixel.
-static inline void write_bg_pixel(uint8_t *screen_b, uint32_t addr,
-                                  uint16_t color, uint8_t pixel_x,
+//
+// Both writes target the XYRAM-resident line_buf; the flush to gint_vram
+// happens once at the end of render_line().
+static inline void write_bg_pixel(uint16_t color, uint8_t pixel_x,
                                   uint8_t bg_layer) {
-    uint16_t *p = (uint16_t *)(screen_b + addr);
     if (blend_any) {
         if (blend_mode != 0 && (blend_first & LAYER_BIT(bg_layer))) {
-            uint16_t dst = *p;
+            uint16_t dst = line_buf[pixel_x];
             uint8_t  dst_layer = layer_id_buf[pixel_x];
             color = blend_apply(color, bg_layer, dst, dst_layer, false);
         }
         layer_id_buf[pixel_x] = bg_layer;
     }
-    *p = color;
+    line_buf[pixel_x] = color;
 }
 
-static inline void write_obj_pixel(uint8_t *screen_b, uint32_t addr,
-                                   uint16_t color, uint8_t pixel_x,
+static inline void write_obj_pixel(uint16_t color, uint8_t pixel_x,
                                    uint8_t obj_mode) {
-    uint16_t *p = (uint16_t *)(screen_b + addr);
     bool semitrans = (obj_mode == 1);
     if (blend_any) {
         if (semitrans ||
             (blend_mode != 0 && (blend_first & LAYER_BIT(LAYER_OBJ)))) {
-            uint16_t dst = *p;
+            uint16_t dst = line_buf[pixel_x];
             uint8_t  dst_layer = layer_id_buf[pixel_x];
             color = blend_apply(color, LAYER_OBJ, dst, dst_layer, semitrans);
         }
         layer_id_buf[pixel_x] = LAYER_OBJ;
     }
-    *p = color;
+    line_buf[pixel_x] = color;
 }
 
 static void compute_layer_mask(void) {
@@ -536,8 +533,6 @@ static void render_decoded_obj(const DecodedObj *obj) {
     bool flip_y = obj->flags & DECOBJ_FLAG_FLIPY;
     bool is_256 = obj->flags & DECOBJ_FLAG_IS256;
 
-    uint32_t surf_addr = LINE_BYTE_OFFSET(v_count.w);
-
     int32_t y = (int32_t)v_count.w - obj->obj_y;
     if (!affine && flip_y) y ^= (obj->y_tiles * 8) - 1;
 
@@ -560,7 +555,6 @@ static void render_decoded_obj(const DecodedObj *obj) {
         pa = -0x100;
     }
 
-    uint32_t address = surf_addr + obj_x * 2;
     uint32_t chr_base = obj->chr_base;
     uint16_t tys      = obj->tys;
     uint8_t  obj_mode = obj->obj_mode;
@@ -623,23 +617,20 @@ static void render_decoded_obj(const DecodedObj *obj) {
                 if (pal_idx
                     && (!windows_active || (layer_mask[sx] & 0x10))) {
                     uint32_t pal_addr = 0x100 | pal_idx | pal_base;
-                    write_obj_pixel((uint8_t *)screen,
-                                    address + i * 2,
-                                    palette[pal_addr],
+                    write_obj_pixel(palette[pal_addr],
                                     (uint8_t)sx, obj_mode);
                 }
             }
 
-            px      += run;
-            ox      += (int32_t)pa * run;
-            address += run * 2;
+            px += run;
+            ox += (int32_t)pa * run;
         }
     } else {
         // Affine sprites: ox/oy advance by pa/pc/pb/pd per pixel
         // and don't have linear tile coherence, so keep the per-
         // pixel loop.
         for (int32_t x = 0; x < rcx * 2;
-             x++, ox += pa, oy += pc, address += 2) {
+             x++, ox += pa, oy += pc) {
             if (obj_x + x < 0)   continue;
             if (obj_x + x >= 240) break;
 
@@ -668,8 +659,7 @@ static void render_decoded_obj(const DecodedObj *obj) {
 
             if (pal_idx
                 && (!windows_active || (layer_mask[obj_x + x] & 0x10)))
-                write_obj_pixel((uint8_t *)screen, address,
-                                palette[pal_addr],
+                write_obj_pixel(palette[pal_addr],
                                 (uint8_t)(obj_x + x), obj_mode);
         }
     }
@@ -695,8 +685,6 @@ static const uint8_t bg_enb[3] = { 0xf, 0x7, 0xc };
 static void render_bg() {
     uint8_t mode = disp_cnt.w & 7;
 
-    uint32_t surf_addr = LINE_BYTE_OFFSET(v_count.w);
-
     switch (mode) {
         case 0:
         case 1:
@@ -718,8 +706,6 @@ static void render_bg() {
 
                     bool affine = mode == 2 || (mode == 1 && bg_idx == 2);
 
-                    uint32_t address = surf_addr;
-
                     if (affine) {
                         int16_t pa = bg_pa[bg_idx].w;
                         int16_t pb = bg_pb[bg_idx].w;
@@ -740,8 +726,7 @@ static void render_bg() {
                         for (x = 0; x < 240;
                             x++,
                             ox += pa,
-                            oy += pc,
-                            address += 2) {
+                            oy += pc) {
                             int16_t tmx = ox >> 11;
                             int16_t tmy = oy >> 11;
 
@@ -765,8 +750,7 @@ static void render_bg() {
                             if (pal_idx
                                 && (!windows_active
                                     || (layer_mask[x] & (1 << bg_idx))))
-                                write_bg_pixel((uint8_t *)screen, address,
-                                               palette[pal_idx], x,
+                                write_bg_pixel(palette[pal_idx], x,
                                                (uint8_t)bg_idx);
                         }
                     } else {
@@ -853,12 +837,10 @@ static void render_bg() {
                                 if (pal_idx
                                     && (!windows_active
                                         || (layer_mask[x + i] & bg_bit))) {
-                                    write_bg_pixel((uint8_t *)screen, address,
-                                                   palette[pal_idx | pal_base],
+                                    write_bg_pixel(palette[pal_idx | pal_base],
                                                    (uint8_t)(x + i),
                                                    (uint8_t)bg_idx);
                                 }
-                                address += 2;
                             }
 
                             x  += pixels;
@@ -884,9 +866,7 @@ static void render_bg() {
                 uint16_t b = (pixel >> 10) & 0x1f;
 
                 uint16_t color = (r << 11) | (((g << 1) | (g >> 4)) << 5) | b;
-                write_bg_pixel((uint8_t *)screen, surf_addr, color, x, LAYER_BG2);
-
-                surf_addr += 2;
+                write_bg_pixel(color, x, LAYER_BG2);
 
                 frm_addr += 2;
             }
@@ -900,10 +880,7 @@ static void render_bg() {
             for (x = 0; x < 240; x++) {
                 uint8_t pal_idx = vram[frm_addr++];
 
-                write_bg_pixel((uint8_t *)screen, surf_addr,
-                               palette[pal_idx], x, LAYER_BG2);
-
-                surf_addr += 2;
+                write_bg_pixel(palette[pal_idx], x, LAYER_BG2);
             }
         }
         break;
@@ -911,13 +888,17 @@ static void render_bg() {
 }
 
 static void render_line() {
-    uint16_t *line = (uint16_t *)((uint8_t *)screen + LINE_BYTE_OFFSET(v_count.w));
+    // Destination row in gint_vram (the centered 240-px region of the
+    // 396x224 screen). The rasterisers write to the XYRAM line_buf;
+    // we flush it here with a single 480-byte streaming memcpy.
+    uint16_t *line = (uint16_t *)((uint8_t *)gint_vram + LINE_BYTE_OFFSET(v_count.w));
 
     // Forced-blank: real hardware drives a white screen and disables all
     // rendering. Match that so the user sees something during BIOS boot
     // instead of a black rectangle.
     if (disp_cnt.w & FORCED_BLANK) {
-        for (int i = 0; i < 240; i++) line[i] = 0xffff;
+        for (int i = 0; i < 240; i++) line_buf[i] = 0xffff;
+        memcpy(line, line_buf, 240 * sizeof(uint16_t));
         return;
     }
 
@@ -934,11 +915,11 @@ static void render_line() {
     }
     if (blend_any) {
         for (int i = 0; i < 240; i++) {
-            line[i] = backdrop;
+            line_buf[i] = backdrop;
             layer_id_buf[i] = LAYER_BD;
         }
     } else {
-        for (int i = 0; i < 240; i++) line[i] = backdrop;
+        for (int i = 0; i < 240; i++) line_buf[i] = backdrop;
     }
 
     compute_layer_mask();
@@ -952,6 +933,11 @@ static void render_line() {
     } else {
         render_bg();
     }
+
+    // Flush the XYRAM line buffer to the gint_vram framebuffer row.
+    // Single sequential 480-byte burst write -- the only main-RAM
+    // store traffic this line produces.
+    memcpy(line, line_buf, 240 * sizeof(uint16_t));
 }
 
 static void vblank_start() {
@@ -986,7 +972,7 @@ static void vcount_match() {
 //   FRAMESKIP=1: render every other
 //   FRAMESKIP=2: render 1 in 3
 #ifndef FRAMESKIP
-#define FRAMESKIP 1
+#define FRAMESKIP 0
 #endif
 
 void run_frame() {
@@ -1021,8 +1007,6 @@ void run_frame() {
     if (render_this_frame) build_sprite_lists();
 
     disp_stat.w &= ~VBLK_FLAG;
-
-    screen = gint_vram;
 
     for (v_count.w = 0; v_count.w < LINES_TOTAL; v_count.w++) {
         disp_stat.w &= ~(HBLK_FLAG | VCNT_FLAG);

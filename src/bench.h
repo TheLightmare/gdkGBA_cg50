@@ -31,6 +31,12 @@ extern uint64_t bench_arm_exec_ticks;
 extern uint64_t bench_render_ticks;
 extern uint64_t bench_dupdate_ticks;
 
+// arm_exec internal phase ticks: time spent in each mode's inner
+// dispatch loop. Their sum should track bench_arm_exec_ticks closely
+// (minus the outer-while + int_halt-check overhead).
+extern uint64_t bench_arm_mode_ticks;
+extern uint64_t bench_thumb_mode_ticks;
+
 // Last frame's measured wall time (microseconds). Updated each frame in
 // main.c so the heartbeat overlay can display "what the bench thinks the
 // fps is" alongside the user's visual perception.
@@ -45,6 +51,41 @@ extern uint32_t bench_freq_hz;
 extern uint32_t bench_mem_slow_read;
 extern uint32_t bench_mem_slow_write;
 extern uint32_t bench_chunk_miss;
+
+// arm_exec instruction-mix counters. Both modes split block-cache vs.
+// single-step paths so we can read coverage and decode traffic. Total
+// instructions per mode = ss + block.
+//   * ARM vs Thumb instruction split  -> (arm_ss+arm_blk) vs (thumb_*)
+//   * Block-cache coverage            -> block_inst / (block_inst+ss_inst)
+//   * Block-decode cold-path traffic  -> block_decodes per interval
+//   * ARM condition-fail rate         -> cond_skip / (arm_ss+arm_blk)
+extern uint32_t bench_arm_cond_skip;
+extern uint32_t bench_arm_ss_inst;
+extern uint32_t bench_arm_block_inst;
+extern uint32_t bench_arm_block_decodes;
+extern uint32_t bench_thumb_ss_inst;
+extern uint32_t bench_thumb_block_inst;
+extern uint32_t bench_thumb_block_decodes;
+
+// Within the ARM block path, count how many uops fell back to the
+// generic arm_dec_call_legacy handler (i.e. were NOT covered by a
+// specialised arm_dec_* function), plus a 16-bucket histogram of
+// those raw ops keyed on (raw_op >> 24) & 0xF. The histogram tells
+// us which encoding families dominate the unspecialised work --
+// directly actionable for picking the next handlers to specialise.
+//
+// Top-nibble bucketing (after the cond field):
+//   0x0/0x1 = data-proc reg, MUL/halfword/signed mem, MSR-reg, BX
+//   0x2/0x3 = data-proc imm, MSR-imm
+//   0x4/0x5 = LDR/STR imm offset (various P/U/W combos)
+//   0x6/0x7 = LDR/STR reg offset
+//   0x8/0x9 = LDM/STM
+//   0xA/0xB = B / BL
+//   0xC/0xD = coprocessor data transfer
+//   0xE     = CDP/MRC/MCR
+//   0xF     = SWI
+extern uint32_t bench_arm_legacy_inst;
+extern uint32_t bench_arm_legacy_hist[16];
 
 #else  // !GBA_BENCH
 

@@ -24,6 +24,7 @@
 #include "mem_swizzle.h"
 #include "rom_buffer.h"
 #include "save_file.h"
+#include "arm_block.h"
 #include "thumb_block.h"
 #include "extram.h"
 
@@ -115,6 +116,7 @@ int main(void) {
     // Allocate the Thumb block cache. Failure is not fatal -- the
     // interpreter runs unchanged when thumb_block_enabled stays false.
     thumb_block_init();
+    arm_block_init();
 
     // Allocate the fit-to-screen source backup buffer (76 KB, prefers
     // extram). Failure is silent; fit mode just stays a no-op.
@@ -438,6 +440,15 @@ int main(void) {
         uint32_t slr_at_start = bench_mem_slow_read;
         uint32_t slw_at_start = bench_mem_slow_write;
         uint32_t cm_at_start  = bench_chunk_miss;
+        uint64_t armm_at_start = bench_arm_mode_ticks;
+        uint64_t thbm_at_start = bench_thumb_mode_ticks;
+        uint32_t acs_at_start = bench_arm_cond_skip;
+        uint32_t ass_at_start = bench_arm_ss_inst;
+        uint32_t abi_at_start = bench_arm_block_inst;
+        uint32_t abd_at_start = bench_arm_block_decodes;
+        uint32_t tss_at_start = bench_thumb_ss_inst;
+        uint32_t tbi_at_start = bench_thumb_block_inst;
+        uint32_t tbd_at_start = bench_thumb_block_decodes;
 #endif
 
         run_frame();
@@ -547,7 +558,7 @@ int main(void) {
         bool is_manual = capture_now_pending && !is_scheduled && !is_spike;
         capture_now_pending = false;
         if (is_scheduled || is_spike || is_manual) {
-            char buf[1280];
+            char buf[2048];
             int n = 0;
             arm_flags_to_cpsr();
             if (is_spike) {
@@ -681,12 +692,32 @@ int main(void) {
             uint32_t fslr = bench_mem_slow_read  - slr_at_start;
             uint32_t fslw = bench_mem_slow_write - slw_at_start;
             uint32_t fcm  = bench_chunk_miss     - cm_at_start;
+            uint32_t farm_us = bench_freq_hz
+                ? (uint32_t)(((bench_arm_mode_ticks - armm_at_start) * 1000000ULL) / bench_freq_hz)
+                : 0;
+            uint32_t fthb_us = bench_freq_hz
+                ? (uint32_t)(((bench_thumb_mode_ticks - thbm_at_start) * 1000000ULL) / bench_freq_hz)
+                : 0;
+            uint32_t facs = bench_arm_cond_skip         - acs_at_start;
+            uint32_t fass = bench_arm_ss_inst           - ass_at_start;
+            uint32_t fabi = bench_arm_block_inst        - abi_at_start;
+            uint32_t fabd = bench_arm_block_decodes     - abd_at_start;
+            uint32_t ftss = bench_thumb_ss_inst         - tss_at_start;
+            uint32_t ftbi = bench_thumb_block_inst      - tbi_at_start;
+            uint32_t ftbd = bench_thumb_block_decodes   - tbd_at_start;
             n += snprintf(buf + n, sizeof(buf) - n,
                 "FRAME breakdown:\n"
                 "  arm_exec=%lu us  render=%lu us  dupdate=%lu us\n"
+                "  arm_mode=%lu us  thumb_mode=%lu us\n"
+                "  arm_ss=%lu  arm_blk=%lu (decodes=%lu)  cond_skip=%lu\n"
+                "  thumb_ss=%lu  thumb_blk=%lu (decodes=%lu)\n"
                 "  slow_read=%lu  slow_write=%lu  chunk_miss=%lu\n",
                 (unsigned long)fa_us, (unsigned long)fr_us,
                 (unsigned long)fd_us,
+                (unsigned long)farm_us, (unsigned long)fthb_us,
+                (unsigned long)fass, (unsigned long)fabi, (unsigned long)fabd,
+                (unsigned long)facs,
+                (unsigned long)ftss, (unsigned long)ftbi, (unsigned long)ftbd,
                 (unsigned long)fslr, (unsigned long)fslw,
                 (unsigned long)fcm);
 
@@ -709,17 +740,60 @@ int main(void) {
                 uint32_t dup_us = bench_freq_hz
                     ? (uint32_t)((bench_dupdate_ticks * 1000000ULL) / bench_freq_hz)
                     : 0;
+                uint32_t armm_us = bench_freq_hz
+                    ? (uint32_t)((bench_arm_mode_ticks * 1000000ULL) / bench_freq_hz)
+                    : 0;
+                uint32_t thbm_us = bench_freq_hz
+                    ? (uint32_t)((bench_thumb_mode_ticks * 1000000ULL) / bench_freq_hz)
+                    : 0;
                 n += snprintf(buf + n, sizeof(buf) - n,
                     "BENCH (totals over %lu frames, freq=%lu Hz):\n"
                     "  arm_exec=%lu us (%lu/frame)\n"
                     "  render  =%lu us (%lu/frame)\n"
                     "  dupdate =%lu us (%lu/frame)\n"
+                    "  arm_mode=%lu us (%lu/frame)  thumb_mode=%lu us (%lu/frame)\n"
+                    "  arm_ss=%lu (%lu/frame)  arm_blk=%lu (%lu/frame)  arm_blk_decodes=%lu\n"
+                    "  cond_skip=%lu (%lu/frame)\n"
+                    "  thumb_ss=%lu (%lu/frame)  thumb_blk=%lu (%lu/frame)  thumb_blk_decodes=%lu\n"
+                    "  arm_legacy=%lu (%lu/frame)  hist 0..F: %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n"
                     "  slow_read=%lu  slow_write=%lu  chunk_miss=%lu\n",
                     (unsigned long)frames_in_span,
                     (unsigned long)bench_freq_hz,
                     (unsigned long)arm_us, (unsigned long)(arm_us / frames_in_span),
                     (unsigned long)ren_us, (unsigned long)(ren_us / frames_in_span),
                     (unsigned long)dup_us, (unsigned long)(dup_us / frames_in_span),
+                    (unsigned long)armm_us, (unsigned long)(armm_us / frames_in_span),
+                    (unsigned long)thbm_us, (unsigned long)(thbm_us / frames_in_span),
+                    (unsigned long)bench_arm_ss_inst,
+                    (unsigned long)(bench_arm_ss_inst / frames_in_span),
+                    (unsigned long)bench_arm_block_inst,
+                    (unsigned long)(bench_arm_block_inst / frames_in_span),
+                    (unsigned long)bench_arm_block_decodes,
+                    (unsigned long)bench_arm_cond_skip,
+                    (unsigned long)(bench_arm_cond_skip / frames_in_span),
+                    (unsigned long)bench_thumb_ss_inst,
+                    (unsigned long)(bench_thumb_ss_inst / frames_in_span),
+                    (unsigned long)bench_thumb_block_inst,
+                    (unsigned long)(bench_thumb_block_inst / frames_in_span),
+                    (unsigned long)bench_thumb_block_decodes,
+                    (unsigned long)bench_arm_legacy_inst,
+                    (unsigned long)(bench_arm_legacy_inst / frames_in_span),
+                    (unsigned long)bench_arm_legacy_hist[0x0],
+                    (unsigned long)bench_arm_legacy_hist[0x1],
+                    (unsigned long)bench_arm_legacy_hist[0x2],
+                    (unsigned long)bench_arm_legacy_hist[0x3],
+                    (unsigned long)bench_arm_legacy_hist[0x4],
+                    (unsigned long)bench_arm_legacy_hist[0x5],
+                    (unsigned long)bench_arm_legacy_hist[0x6],
+                    (unsigned long)bench_arm_legacy_hist[0x7],
+                    (unsigned long)bench_arm_legacy_hist[0x8],
+                    (unsigned long)bench_arm_legacy_hist[0x9],
+                    (unsigned long)bench_arm_legacy_hist[0xA],
+                    (unsigned long)bench_arm_legacy_hist[0xB],
+                    (unsigned long)bench_arm_legacy_hist[0xC],
+                    (unsigned long)bench_arm_legacy_hist[0xD],
+                    (unsigned long)bench_arm_legacy_hist[0xE],
+                    (unsigned long)bench_arm_legacy_hist[0xF],
                     (unsigned long)bench_mem_slow_read,
                     (unsigned long)bench_mem_slow_write,
                     (unsigned long)bench_chunk_miss);
@@ -727,9 +801,20 @@ int main(void) {
                 bench_arm_exec_ticks  = 0;
                 bench_render_ticks    = 0;
                 bench_dupdate_ticks   = 0;
+                bench_arm_mode_ticks  = 0;
+                bench_thumb_mode_ticks = 0;
                 bench_mem_slow_read   = 0;
                 bench_mem_slow_write  = 0;
                 bench_chunk_miss      = 0;
+                bench_arm_cond_skip   = 0;
+                bench_arm_ss_inst     = 0;
+                bench_arm_block_inst  = 0;
+                bench_arm_block_decodes = 0;
+                bench_thumb_ss_inst   = 0;
+                bench_thumb_block_inst = 0;
+                bench_thumb_block_decodes = 0;
+                bench_arm_legacy_inst = 0;
+                for (int hi = 0; hi < 16; hi++) bench_arm_legacy_hist[hi] = 0;
             }
             n += snprintf(buf + n, sizeof(buf) - n, "\n");
 

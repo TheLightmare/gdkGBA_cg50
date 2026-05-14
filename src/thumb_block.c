@@ -38,7 +38,10 @@ static uint32_t thumb_uop_pool_head = 0;
 #define THUMB_TOTAL_PAGES  (THUMB_IWRAM_PAGES + THUMB_EWRAM_PAGES)
 #define THUMB_PAGE_NONE    0xFFFFu
 
-static uint16_t thumb_page_gen[THUMB_TOTAL_PAGES];
+// Non-static: arm_block.c reads this array directly for its own lookup
+// freshness check. Both caches share the same page identity so a single
+// invalidation hook in arm_mem.c covers both.
+uint16_t thumb_page_gen[THUMB_TOTAL_PAGES];
 
 // Map a guest address to its page index in thumb_page_gen, or
 // THUMB_PAGE_NONE for non-RAM regions.
@@ -265,6 +268,7 @@ void thumb_block_uninit(void) {
     if (thumb_uop_pool)  { kfree(thumb_uop_pool);  thumb_uop_pool  = NULL; }
 }
 
+__attribute__((noinline))
 const thumb_block_t *thumb_block_lookup(uint32_t inst_pc) {
     if (!thumb_block_enabled) return NULL;
     uint8_t reg = (inst_pc >> 24) & 0xFu;
@@ -302,6 +306,7 @@ static inline uint16_t decode_read_op(uint32_t pc) {
     return 0;
 }
 
+__attribute__((noinline))
 const thumb_block_t *thumb_block_decode(uint32_t inst_pc) {
     if (!thumb_block_enabled) return NULL;
     uint8_t reg = (inst_pc >> 24) & 0xFu;
