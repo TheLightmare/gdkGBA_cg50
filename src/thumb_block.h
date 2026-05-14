@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "sh4_jit.h"
+
 // Decoded basic-block cache for ROM-resident Thumb code.
 //
 // Each cache entry is a sequence of pre-decoded micro-ops -- a handler
@@ -66,6 +68,10 @@ typedef struct {
     uint16_t generation;     // matches pool's current_gen, else stale
     uint16_t page_idx;       // RAM page; 0xFFFF for ROM blocks
     uint16_t page_gen;       // RAM page gen at decode time (ignored for ROM)
+    // Phase 0 JIT slot. NULL = walk uops via thumb_uop_pool[ops_offset];
+    // non-NULL = call this SH4 routine with &arm_r in R4. The executor
+    // pre-credits total_cycles before the call. See docs/SH4_JIT_PLAN.md.
+    native_block_fn_t native_entry;
 } thumb_block_t;
 
 // Capacity. Sized so the whole structure fits in ~128 KB extram.

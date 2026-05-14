@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "sh4_jit.h"
+
 // Decoded basic-block cache for ARM-mode code. Mirrors thumb_block.h
 // but with 4-byte instructions and a per-uop condition-code field, so
 // the executor can run conditional ARM instructions inside a block
@@ -33,8 +35,8 @@ typedef struct arm_uop_s {
     uint32_t arg_c;   // wide enough for imm12 / imm24 / address parts
 } arm_uop_t;
 
-// Cache directory entry, 16 bytes. Same layout as thumb_block_t so
-// the executor pattern carries over cleanly.
+// Cache directory entry. Same layout as thumb_block_t so the executor
+// pattern carries over cleanly.
 typedef struct {
     uint32_t start_pc;       // sentinel 0xFFFFFFFF = empty
     uint16_t length;
@@ -43,6 +45,8 @@ typedef struct {
     uint16_t generation;
     uint16_t page_idx;       // 0xFFFF for ROM blocks
     uint16_t page_gen;
+    // Phase 0 JIT slot -- see thumb_block.h for the convention.
+    native_block_fn_t native_entry;
 } arm_block_t;
 
 // Capacity. ARM directory same size as Thumb (4096 slots × 16 B = 64 KB).

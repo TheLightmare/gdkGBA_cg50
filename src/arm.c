@@ -4304,6 +4304,27 @@ void arm_exec(uint32_t target_cycles) {
                         b = thumb_block_decode(inst_pc);
                     }
                     if (b) {
+                        if (b->native_entry) {
+                            // Phase 0 dead branch: the decoder never
+                            // installs a native_entry, so we should
+                            // never land here. Phase 1+ will populate
+                            // it with JIT-emitted SH4 code; calling
+                            // convention is documented in sh4_jit.h.
+                            //
+                            // The executor pre-credits b->total_cycles
+                            // and clears pipe_reload; the native code
+                            // is responsible for the rest (R15 update,
+                            // pipe state, etc.).
+                            arm_cycles += b->total_cycles;
+                            pipe_reload = false;
+                            b->native_entry(&arm_r);
+                            pipe_reload = false;
+                            if (int_halt) {
+                                arm_cycles = target_cycles;
+                                break;
+                            }
+                            continue;
+                        }
                         const thumb_uop_t *ops =
                             thumb_uop_pool + b->ops_offset;
                         arm_cycles += b->total_cycles;
@@ -4395,6 +4416,19 @@ void arm_exec(uint32_t target_cycles) {
                         b = arm_block_decode(inst_pc);
                     }
                     if (b) {
+                        if (b->native_entry) {
+                            // Phase 0 dead branch -- see the Thumb-side
+                            // copy above for the convention.
+                            arm_cycles += b->total_cycles;
+                            pipe_reload = false;
+                            b->native_entry(&arm_r);
+                            pipe_reload = false;
+                            if (int_halt) {
+                                arm_cycles = target_cycles;
+                                break;
+                            }
+                            continue;
+                        }
                         const arm_uop_t *ops =
                             arm_uop_pool + b->ops_offset;
                         arm_cycles += b->total_cycles;

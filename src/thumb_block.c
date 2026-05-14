@@ -269,6 +269,7 @@ bool thumb_block_init(void) {
         thumb_block_dir[i].generation   = 0;
         thumb_block_dir[i].page_idx     = THUMB_PAGE_NONE;
         thumb_block_dir[i].page_gen     = 0;
+        thumb_block_dir[i].native_entry = NULL;
     }
 
     // Reset all page generations. Static BSS already zero, but be
@@ -413,6 +414,10 @@ const thumb_block_t *thumb_block_decode(uint32_t inst_pc) {
     slot->generation   = thumb_block_current_gen;
     slot->page_idx     = page_idx;
     slot->page_gen     = page_gen;
+    // Phase 0: decoder never emits native code; leave the slot clear so
+    // the executor takes the interpreter path. Explicit because we may
+    // be overwriting an entry from a different PC that hashed here.
+    slot->native_entry = NULL;
 
     thumb_uop_pool_head += length;
     return slot;

@@ -255,6 +255,7 @@ bool arm_block_init(void) {
         arm_block_dir[i].generation   = 0;
         arm_block_dir[i].page_idx     = ARM_PAGE_NONE;
         arm_block_dir[i].page_gen     = 0;
+        arm_block_dir[i].native_entry = NULL;
     }
 
     arm_uop_pool_head      = 0;
@@ -364,6 +365,9 @@ const arm_block_t *arm_block_decode(uint32_t inst_pc) {
     slot->generation   = arm_block_current_gen;
     slot->page_idx     = page_idx;
     slot->page_gen     = page_gen;
+    // Phase 0: decoder never emits native code; leave the slot clear
+    // (explicit in case we're overwriting a different-PC entry).
+    slot->native_entry = NULL;
 
     arm_uop_pool_head += length;
     return slot;
