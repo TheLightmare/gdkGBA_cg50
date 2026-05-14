@@ -86,6 +86,7 @@ extern void t16_dec_sub_imm3 (const thumb_uop_t *uop);
 extern void t16_dec_add_reg  (const thumb_uop_t *uop);
 extern void t16_dec_sub_reg  (const thumb_uop_t *uop);
 extern void t16_dec_b_imm11  (const thumb_uop_t *uop);
+extern void t16_dec_b_cond   (const thumb_uop_t *uop);
 extern void t16_dec_call_legacy(const thumb_uop_t *uop);
 
 // Pick the right uop handler for `op` and fill in the operand fields it
@@ -180,6 +181,26 @@ static void decode_thumb_op(uint16_t op, thumb_uop_t *out) {
             out->arg_b   = (op >> 3) & 0x7;
             out->arg_c   = (uint16_t)(((op >> 6) & 0x1f) << 2);
             return;
+        case 0b11010:
+        case 0b11011: {
+            // B<cond> #imm8 -- conditional branch. Bits 11..8 are the
+            // 4-bit ARM condition; cond=14 (0xDE) is UDF and cond=15
+            // (0xDF) is SWI -- both encoded in this top5 range, but
+            // routed to legacy.
+            //
+            // Sign-extend imm8 (bits 7..0) and shift left by 1 to get
+            // the byte offset in [-256, +254]. Fits in int16_t.
+            uint8_t cond = (op >> 8) & 0xf;
+            if (cond >= 14) {
+                out->handler = t16_dec_call_legacy;
+                return;
+            }
+            int32_t imm = ((int32_t)((uint32_t)op << 24)) >> 23;
+            out->handler = t16_dec_b_cond;
+            out->arg_a   = cond;
+            out->arg_c   = (uint16_t)imm;
+            return;
+        }
         case 0b11100: {
             // B #imm11 -- compute the sign-extended (imm11 << 1) byte
             // offset at decode time. Range is [-2048, +2046], fits in

@@ -3925,6 +3925,29 @@ void t16_dec_b_imm11(const thumb_uop_t *uop) {
     if (imm == -4) int_halt = true;   // tight `b .` idle spin
 }
 
+// B<cond> #imm8 -- conditional branch. arg_a holds the 4-bit ARM
+// condition (0..13; cond=14 is UDF and cond=15 is SWI, both routed
+// to legacy by the decoder). arg_c holds the sign-extended (imm8
+// << 1) byte offset, in [-256, +254].
+//
+// The thumb_legacy histogram puts ~42% of legacy Thumb mass in
+// bucket 0xD (snap 6: 705k cumulative over 240 frames). Bucket 0xD
+// is dominated by B<cond>, which is also block-ending: every cond
+// branch in a Thumb block currently runs t16_dec_call_legacy AND
+// terminates the block, paying dispatch overhead in two ways.
+//
+// Block-ending behaviour matches the legacy path: arm_load_pipe()
+// sets pipe_reload on the taken side; on the not-taken side the
+// block executor sequentially exits (b->length=1 for any block
+// that ends with cond-B) and re-loads the pipe at the next
+// instruction.
+void t16_dec_b_cond(const thumb_uop_t *uop) {
+    if (!arm_cond(uop->arg_a)) return;
+    int32_t imm = (int16_t)uop->arg_c;
+    arm_r.r[15] += imm;
+    arm_load_pipe();
+}
+
 // Fallback for any opcode without a specialised handler. Restores the
 // arm_op global and dispatches into the existing handler table -- same
 // effect as Phase 4a's executor, just routed through the new handler
