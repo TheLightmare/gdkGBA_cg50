@@ -122,12 +122,14 @@ static inline uint32_t thumb_block_hash(uint32_t inst_pc) {
 // non-RAM addresses this is a no-op (page index resolves to 0xFFFF).
 void thumb_block_invalidate_page(uint32_t addr);
 
-// Walk the directory and clear native_entry on every slot. Called from
-// jit_arena_recycle() when the JIT arena fills and we want to reuse it
-// for fresh codegen -- old native_entry pointers would refer to about-
-// to-be-overwritten arena bytes, so they must be NULL'd before the
-// cursor is reset. Safe to call mid-decode; the executor's
-// native_entry check just sees NULL and takes the interpreter path.
-void thumb_block_clear_native_entries(void);
+// Walk the directory and clear native_entry on every slot whose
+// pointer falls in [base, end). Called from jit_arena_recycle() when
+// a generation of the JIT arena is about to be overwritten -- entries
+// pointing into that range would refer to soon-stale bytes. Safe to
+// call mid-decode; the executor's native_entry check just sees NULL
+// and takes the interpreter path. Entries pointing outside [base, end)
+// are left untouched, which is how generational eviction preserves
+// recently-JIT'd blocks in the other generation.
+void thumb_block_clear_native_entries_in(const void *base, const void *end);
 
 #endif // THUMB_BLOCK_H

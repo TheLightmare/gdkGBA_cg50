@@ -389,9 +389,14 @@ const arm_block_t *arm_block_decode(uint32_t inst_pc) {
     return slot;
 }
 
-void arm_block_clear_native_entries(void) {
+void arm_block_clear_native_entries_in(const void *base, const void *end) {
     if (!arm_block_dir) return;
+    const uint8_t *lo = (const uint8_t *)base;
+    const uint8_t *hi = (const uint8_t *)end;
     for (uint32_t i = 0; i < ARM_BLOCK_DIR_SIZE; i++) {
-        arm_block_dir[i].native_entry = NULL;
+        const uint8_t *p = (const uint8_t *)arm_block_dir[i].native_entry;
+        if (p >= lo && p < hi) {
+            arm_block_dir[i].native_entry = NULL;
+        }
     }
 }

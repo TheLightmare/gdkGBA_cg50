@@ -75,10 +75,15 @@ void thumb_block_invalidate_page(uint32_t addr) {
     }
 }
 
-void thumb_block_clear_native_entries(void) {
+void thumb_block_clear_native_entries_in(const void *base, const void *end) {
     if (!thumb_block_dir) return;
+    const uint8_t *lo = (const uint8_t *)base;
+    const uint8_t *hi = (const uint8_t *)end;
     for (uint32_t i = 0; i < THUMB_BLOCK_DIR_SIZE; i++) {
-        thumb_block_dir[i].native_entry = NULL;
+        const uint8_t *p = (const uint8_t *)thumb_block_dir[i].native_entry;
+        if (p >= lo && p < hi) {
+            thumb_block_dir[i].native_entry = NULL;
+        }
     }
 }
 

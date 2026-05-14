@@ -15,15 +15,32 @@
 bool jit_enabled = false;
 char jit_init_status[80] = "jit-arena: not initialised";
 
-// 256 KB initial budget per docs/SH4_JIT_PLAN.md. Phase 1+ can raise this
-// if frequent jit_reset() calls indicate eviction pressure. SH4 L1 line
-// is 32 bytes; the icbi loop in jit_emit_end walks one line at a time.
+// 256 KB total arena, split into two 128 KB generations for partial
+// eviction. When the active generation fills, we switch to the other
+// one and clear only the native_entry pointers that fall into the
+// soon-to-be-overwritten gen. Blocks recently JIT'd into the other
+// gen survive the recycle and keep executing natively.
+//
+// SH4 L1 line is 32 bytes; the icbi loop in jit_emit_end walks one
+// line at a time.
 #define JIT_ARENA_BYTES (256u * 1024u)
+#define JIT_GEN_BYTES   (JIT_ARENA_BYTES / 2u)
 #define SH4_CACHE_LINE   32u
 
 static uint16_t *jit_arena_base   = NULL;
 static uint16_t *jit_arena_end    = NULL;
 static uint16_t *jit_arena_cursor = NULL;
+
+// Generations. jit_gens[active_gen] is where the cursor lives; the
+// other gen holds the "previous" half-arena of JIT'd code, still valid
+// and callable. Cursor is always within [jit_gens[active_gen].base,
+// jit_gens[active_gen].end).
+typedef struct {
+    uint16_t *base;
+    uint16_t *end;
+} jit_gen_t;
+static jit_gen_t jit_gens[2];
+static int      jit_active_gen = 0;
 
 bool jit_init(void) {
     if (jit_enabled) return true;
@@ -39,7 +56,12 @@ bool jit_init(void) {
 
     jit_arena_base   = (uint16_t *)p;
     jit_arena_end    = (uint16_t *)((uint8_t *)p + JIT_ARENA_BYTES);
-    jit_arena_cursor = jit_arena_base;
+    jit_gens[0].base = jit_arena_base;
+    jit_gens[0].end  = (uint16_t *)((uint8_t *)jit_arena_base + JIT_GEN_BYTES);
+    jit_gens[1].base = jit_gens[0].end;
+    jit_gens[1].end  = jit_arena_end;
+    jit_active_gen   = 0;
+    jit_arena_cursor = jit_gens[0].base;
     jit_enabled = true;
 
     snprintf(jit_init_status, sizeof(jit_init_status),
@@ -50,19 +72,23 @@ bool jit_init(void) {
 
 void jit_reset(void) {
     if (!jit_enabled) return;
-    jit_arena_cursor = jit_arena_base;
+    jit_active_gen   = 0;
+    jit_arena_cursor = jit_gens[0].base;
 }
 
 void jit_arena_recycle(void) {
     if (!jit_enabled) return;
-    // Clear native_entry on every directory slot before recycling the
-    // arena. Old pointers would refer to about-to-be-overwritten
-    // memory, so any future executor lookup that hit them would jump
-    // into stale or partially-rewritten code. NULL is the universal
-    // "fall back to interpreter" signal.
-    arm_block_clear_native_entries();
-    thumb_block_clear_native_entries();
-    jit_arena_cursor = jit_arena_base;
+    // Switch the active generation. The newly-active gen is about to
+    // be overwritten, so clear native_entry on every block that points
+    // into its range. Blocks that JIT'd into the OTHER gen (now the
+    // inactive one) are untouched and keep executing natively until
+    // the next recycle. This roughly halves the per-recycle re-JIT
+    // pressure vs the chunk-9 full-clear policy.
+    jit_active_gen ^= 1;
+    jit_gen_t *now_active = &jit_gens[jit_active_gen];
+    arm_block_clear_native_entries_in(now_active->base, now_active->end);
+    thumb_block_clear_native_entries_in(now_active->base, now_active->end);
+    jit_arena_cursor = now_active->base;
 #if GBA_BENCH
     bench_jit_arena_recycles++;
 #endif
@@ -70,14 +96,16 @@ void jit_arena_recycle(void) {
 
 uint16_t *jit_emit_begin(size_t budget_bytes) {
     if (!jit_enabled) return NULL;
-    size_t remaining = (size_t)((uint8_t *)jit_arena_end -
+    jit_gen_t *active = &jit_gens[jit_active_gen];
+    size_t remaining = (size_t)((uint8_t *)active->end -
                                 (uint8_t *)jit_arena_cursor);
     if (remaining < budget_bytes) {
-        // Arena exhausted: recycle and retry. After recycling, the full
-        // arena is available; if even that can't fit the request the
-        // block is genuinely too big and we bail.
+        // Active generation exhausted: switch + clear the other gen +
+        // retry. After switching the full generation is available; if
+        // a single block exceeds even that, bail.
         jit_arena_recycle();
-        remaining = (size_t)((uint8_t *)jit_arena_end -
+        active = &jit_gens[jit_active_gen];
+        remaining = (size_t)((uint8_t *)active->end -
                              (uint8_t *)jit_arena_cursor);
         if (remaining < budget_bytes) return NULL;
     }
