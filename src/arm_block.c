@@ -6,8 +6,12 @@
 #include <gint/kmalloc.h>
 
 #include "arm_mem.h"
+#include "build_flags.h"
 #include "extram.h"
 #include "io.h"           // ws_s_arm
+#if GBA_JIT_ARM
+#  include "arm_jit.h"
+#endif
 #include "mem_swizzle.h"
 #include "rom_buffer.h"
 #include "thumb_block.h"  // shared page-gen for RAM-page invalidation
@@ -365,10 +369,18 @@ const arm_block_t *arm_block_decode(uint32_t inst_pc) {
     slot->generation   = arm_block_current_gen;
     slot->page_idx     = page_idx;
     slot->page_gen     = page_gen;
-    // Phase 0: decoder never emits native code; leave the slot clear
-    // (explicit in case we're overwriting a different-PC entry).
+    // Decoder default: NULL native_entry so the executor takes the
+    // interpreter path. Explicit because we may be overwriting an entry
+    // from a different PC that hashed here.
     slot->native_entry = NULL;
 
     arm_uop_pool_head += length;
+
+#if GBA_JIT_ARM
+    // Phase 1 Chunk 4: try to JIT-compile the block. On any failure
+    // (arena full, block too long, etc.) native_entry stays NULL and
+    // the executor falls back to walking the uop list.
+    (void)arm_jit_compile_block(slot);
+#endif
     return slot;
 }

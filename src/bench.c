@@ -38,6 +38,9 @@ uint32_t bench_thumb_legacy_hist[16];
 uint32_t bench_thumb_jit_compiled;
 uint32_t bench_thumb_jit_specialized_ops;
 
+uint32_t bench_arm_jit_compiled;
+uint32_t bench_arm_jit_specialized_ops;
+
 static int bench_tmu_id = -1;
 static uint32_t bench_tcor;
 

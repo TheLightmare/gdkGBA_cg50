@@ -119,6 +119,11 @@ extern uint32_t bench_thumb_legacy_hist[16];
 extern uint32_t bench_thumb_jit_compiled;
 extern uint32_t bench_thumb_jit_specialized_ops;
 
+// ARM-side equivalents. Same semantics: compiled = blocks that landed
+// a native_entry, specialized_ops = inline-emitted uops in those blocks.
+extern uint32_t bench_arm_jit_compiled;
+extern uint32_t bench_arm_jit_specialized_ops;
+
 #else  // !GBA_BENCH
 
 // Release builds: bench is fully compiled out. Provide an inline no-op

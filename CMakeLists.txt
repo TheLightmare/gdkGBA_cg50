@@ -12,6 +12,7 @@ find_package(Gint 2.9 REQUIRED)
 set(SOURCES
   src/main.c
   src/arm_block.c
+  src/arm_jit.c
   src/arm_mem.c
   src/arm.c
   src/bench.c
@@ -121,6 +122,14 @@ if(GBA_JIT_THUMB)
     target_compile_definitions(myaddin PRIVATE GBA_JIT_THUMB=1)
 endif()
 message(STATUS "GBA_JIT_THUMB = ${GBA_JIT_THUMB}")
+
+# Phase 1 chunk 4: ARM-side JIT. Toggleable independently of the Thumb
+# JIT so we can isolate any regression to one side.
+option(GBA_JIT_ARM "JIT-compile ARM basic blocks to native SH4" OFF)
+if(GBA_JIT_ARM)
+    target_compile_definitions(myaddin PRIVATE GBA_JIT_ARM=1)
+endif()
+message(STATUS "GBA_JIT_ARM = ${GBA_JIT_ARM}")
 
 # Link-time optimization: lets the linker inline across translation
 # units. Critical here because arm_read() in arm_mem.c calls

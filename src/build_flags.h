@@ -22,6 +22,9 @@
 //                     SH4 code (Phase 1+ of the JIT). When off, the block
 //                     cache stays interpreter-only. Independent of the
 //                     GBA_BUILD flavor.
+//   GBA_JIT_ARM       Same, but for ARM-mode blocks. Independent of
+//                     GBA_JIT_THUMB so each side can be A/B tested in
+//                     isolation.
 
 #ifndef GBA_BENCH
 #  define GBA_BENCH 0
@@ -40,6 +43,9 @@
 #endif
 #ifndef GBA_JIT_THUMB
 #  define GBA_JIT_THUMB 0
+#endif
+#ifndef GBA_JIT_ARM
+#  define GBA_JIT_ARM 0
 #endif
 
 // GBA_DIAG_LOG snapshots dump bench accumulators and the arm trace state
