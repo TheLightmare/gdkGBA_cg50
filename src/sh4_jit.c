@@ -10,10 +10,19 @@
 bool jit_enabled = false;
 char jit_init_status[80] = "jit-arena: not initialised";
 
-// 256 KB initial budget per docs/SH4_JIT_PLAN.md. Phase 1+ can raise this
-// if frequent jit_reset() calls indicate eviction pressure. SH4 L1 line
-// is 32 bytes; the icbi loop in jit_emit_end walks one line at a time.
-#define JIT_ARENA_BYTES (256u * 1024u)
+// Phase 2 chunk 2: grow arena from 256 KB to 1 MB. The Phase 1 256 KB
+// budget filled in the first few frames (snap 0+1 of the chunk-1 trace
+// showed >500 blocks compiled by frame 5, well past 256 KB at the
+// conservative ~500 B/block estimate). Once full, jit_emit_begin
+// returned NULL on every subsequent decode -- so chunk 1's inline
+// data-proc REG specs applied only to ~20 ARM boot blocks and never
+// reached the gameplay hot path. Growing the arena targets that
+// coverage gap directly: extram has plenty of headroom on the CG-50
+// (~4 MB usable after OS overhead) and the snap-6 working set is
+// only ~1200 unique blocks (~600 KB at the conservative estimate), so
+// 1 MB should hold it without thrash. SH4 L1 line is 32 bytes; the
+// icbi loop in jit_emit_end walks one line at a time.
+#define JIT_ARENA_BYTES (1024u * 1024u)
 #define SH4_CACHE_LINE   32u
 
 static uint16_t *jit_arena_base   = NULL;
