@@ -3292,6 +3292,20 @@ static void hle_irq_enter(uint32_t handler_addr) {
     arm_flag_set(ARM_I, true);
 
     arm_r.r[15] = handler_addr;
+    // Compiler barrier. Without it, LTO + the volatile read-modify-write on
+    // arm_hle_irq_count below let GCC sink this R15 store all the way to
+    // the function epilogue -- leaving only ~6 SH4 insns (the register pops)
+    // between the store and the tail-jump into arm_load_pipe(), which then
+    // re-reads arm_r.r[15] to drive the pipeline refetch. arm_r lives in
+    // XYRAM (GXRAM); with that little shadow the load reads the *old*
+    // pre-IRQ R15 instead of handler_addr, the cart's pre-IRQ instruction
+    // gets executed in IRQ banked-register mode, and the calc reboots from
+    // whatever downstream corruption that causes.
+    //
+    // The barrier costs zero runtime instructions -- it only constrains the
+    // optimizer's scheduling, which is the only thing actually broken here.
+    // Bisected down to this single site; see commit message for the trace.
+    __asm__ volatile ("" ::: "memory");
 #ifdef ARM_TRACE_ENABLE
     arm_hle_irq_count++;
 #endif
