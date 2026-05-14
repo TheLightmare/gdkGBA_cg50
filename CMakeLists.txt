@@ -67,8 +67,8 @@ target_link_libraries(myaddin Gint::Gint)
 # Power users can also set GBA_BENCH / GBA_DEBUG_OVERLAY / GBA_DIAG_LOG /
 # GBA_TRACE individually -- GBA_BUILD just expands to a sensible default
 # combination. See src/build_flags.h.
-set(GBA_BUILD "release" CACHE STRING "Build flavor: release | bench | trace")
-set_property(CACHE GBA_BUILD PROPERTY STRINGS release bench trace)
+set(GBA_BUILD "release" CACHE STRING "Build flavor: release | bench | bench-trace | trace")
+set_property(CACHE GBA_BUILD PROPERTY STRINGS release bench bench-trace trace)
 
 if(GBA_BUILD STREQUAL "trace")
     target_compile_definitions(myaddin PRIVATE
@@ -76,13 +76,20 @@ if(GBA_BUILD STREQUAL "trace")
         GBA_DEBUG_OVERLAY=1
         GBA_DIAG_LOG=1
         GBA_TRACE=1)
+elseif(GBA_BUILD STREQUAL "bench-trace")
+    # Bisect helper: bench + trace state, no diag log file I/O. Splits the
+    # "trace build crashes but bench doesn't" question into "is it the trace
+    # recording code, or is it the snap_dump path?"
+    target_compile_definitions(myaddin PRIVATE
+        GBA_BENCH=1
+        GBA_TRACE=1)
 elseif(GBA_BUILD STREQUAL "bench")
     target_compile_definitions(myaddin PRIVATE GBA_BENCH=1)
 elseif(GBA_BUILD STREQUAL "release")
     # No diagnostic flags. The hot path stays clean.
 else()
     message(FATAL_ERROR
-        "GBA_BUILD must be one of: release | bench | trace (got '${GBA_BUILD}')")
+        "GBA_BUILD must be one of: release | bench | bench-trace | trace (got '${GBA_BUILD}')")
 endif()
 message(STATUS "GBA_BUILD = ${GBA_BUILD}")
 
