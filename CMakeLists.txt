@@ -67,13 +67,21 @@ target_link_libraries(myaddin Gint::Gint)
 # Power users can also set GBA_BENCH / GBA_DEBUG_OVERLAY / GBA_DIAG_LOG /
 # GBA_TRACE individually -- GBA_BUILD just expands to a sensible default
 # combination. See src/build_flags.h.
-set(GBA_BUILD "release" CACHE STRING "Build flavor: release | bench | bench-trace | trace")
-set_property(CACHE GBA_BUILD PROPERTY STRINGS release bench bench-trace trace)
+set(GBA_BUILD "release" CACHE STRING "Build flavor: release | bench | bench-trace | trace-no-overlay | trace")
+set_property(CACHE GBA_BUILD PROPERTY STRINGS release bench bench-trace trace-no-overlay trace)
 
 if(GBA_BUILD STREQUAL "trace")
     target_compile_definitions(myaddin PRIVATE
         GBA_BENCH=1
         GBA_DEBUG_OVERLAY=1
+        GBA_DIAG_LOG=1
+        GBA_TRACE=1)
+elseif(GBA_BUILD STREQUAL "trace-no-overlay")
+    # Bisect helper: full trace minus the per-frame heartbeat overlay.
+    # Splits "is it DIAG_LOG (snap_dump file I/O / spike snapshots) or
+    # the overlay's per-frame arm_readb + dprint pair?"
+    target_compile_definitions(myaddin PRIVATE
+        GBA_BENCH=1
         GBA_DIAG_LOG=1
         GBA_TRACE=1)
 elseif(GBA_BUILD STREQUAL "bench-trace")
@@ -89,7 +97,7 @@ elseif(GBA_BUILD STREQUAL "release")
     # No diagnostic flags. The hot path stays clean.
 else()
     message(FATAL_ERROR
-        "GBA_BUILD must be one of: release | bench | bench-trace | trace (got '${GBA_BUILD}')")
+        "GBA_BUILD must be one of: release | bench | bench-trace | trace-no-overlay | trace (got '${GBA_BUILD}')")
 endif()
 message(STATUS "GBA_BUILD = ${GBA_BUILD}")
 
