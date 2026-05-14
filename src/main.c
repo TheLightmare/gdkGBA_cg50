@@ -14,6 +14,7 @@
 #include "gint_gba.h"
 //===============
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -81,6 +82,26 @@ static uint32_t to_pow2(uint32_t val) {
 // load) would otherwise corrupt that state. With BACKUP mode gint copies
 // XYRAM/ILRAM into this buffer on switch-out and restores on switch-in.
 static uint8_t onchip_backup_buf[GINT_ONCHIP_BUFSIZE];
+
+// Bounds-safe snprintf accumulator for the diagnostic snap buffer. The
+// naive `n += snprintf(buf+n, sizeof(buf)-n, ...)` pattern overshoots
+// sizeof(buf) when a format would have produced more than the remaining
+// space -- snprintf returns "would have written" not "did write" -- and
+// the next call then does an unsigned underflow on the size argument and
+// writes past the buffer end. Clamp n to bufsize-1 after every call.
+static size_t safe_append(char *buf, size_t bufsize, size_t n,
+                          const char *fmt, ...) {
+    if (n >= bufsize) return n;
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(buf + n, bufsize - n, fmt, ap);
+    va_end(ap);
+    if (r > 0) {
+        n += (size_t)r;
+        if (n >= bufsize) n = bufsize - 1;
+    }
+    return n;
+}
 
 int main(void) {
     // Set up on-chip RAM backup BEFORE any code that might world-switch
@@ -558,37 +579,37 @@ int main(void) {
         bool is_manual = capture_now_pending && !is_scheduled && !is_spike;
         capture_now_pending = false;
         if (is_scheduled || is_spike || is_manual) {
-            char buf[2048];
-            int n = 0;
+            char buf[4096];
+            size_t n = 0;
             arm_flags_to_cpsr();
             if (is_spike) {
-                n += snprintf(buf + n, sizeof(buf) - n,
+                n = safe_append(buf, sizeof(buf), n,
                     "--- SPIKE %d (frame %lu, this frame=%lu us) ---\n",
                     spike_dumps, (unsigned long)loop_frame,
                     (unsigned long)frame_us);
             } else if (is_manual) {
-                n += snprintf(buf + n, sizeof(buf) - n,
+                n = safe_append(buf, sizeof(buf), n,
                     "--- MANUAL %d (frame %lu, this frame=%lu us) ---\n",
                     manual_dumps, (unsigned long)loop_frame,
                     (unsigned long)frame_us);
             } else {
-                n += snprintf(buf + n, sizeof(buf) - n,
+                n = safe_append(buf, sizeof(buf), n,
                     "--- snap %d (frame %lu, this frame=%lu us) ---\n",
                     dumps_done, (unsigned long)loop_frame,
                     (unsigned long)frame_us);
             }
-            n += snprintf(buf + n, sizeof(buf) - n,
+            n = safe_append(buf, sizeof(buf), n,
                 "PC=%08lX CPSR=%08lX halt=%d\n",
                 (unsigned long)arm_r.r[15],
                 (unsigned long)arm_r.cpsr,
                 (int)int_halt);
-            n += snprintf(buf + n, sizeof(buf) - n,
+            n = safe_append(buf, sizeof(buf), n,
                 "IE=%04X IF=%04X IME=%X DISPCNT=%04X PAL0=%04X\n",
                 (unsigned)int_enb.w, (unsigned)int_ack.w,
                 (unsigned)(int_enb_m.w & 1),
                 (unsigned)disp_cnt.w, (unsigned)palette[0]);
             for (int i = 0; i < 16; i += 4) {
-                n += snprintf(buf + n, sizeof(buf) - n,
+                n = safe_append(buf, sizeof(buf), n,
                     "r%d-r%d: %08lX %08lX %08lX %08lX\n",
                     i, i + 3,
                     (unsigned long)arm_r.r[i + 0],
@@ -602,7 +623,7 @@ int main(void) {
             // chunk load since the snapshot only fires every 30 frames.
             uint32_t pc = arm_r.r[15] & ~1u;
             uint32_t base = pc >= 8 ? pc - 8 : pc;
-            n += snprintf(buf + n, sizeof(buf) - n, "@%08lX:",
+            n = safe_append(buf, sizeof(buf), n, "@%08lX:",
                 (unsigned long)base);
             for (int j = 0; j < 32; j++) {
                 uint8_t b;
@@ -613,10 +634,10 @@ int main(void) {
                 else if ((a >> 24) >= 8 && (a >> 24) <= 0xB)
                                             b = arm_readb(a);
                 else                        b = 0;
-                if (j == 8) n += snprintf(buf + n, sizeof(buf) - n, " >");
-                n += snprintf(buf + n, sizeof(buf) - n, " %02X", b);
+                if (j == 8) n = safe_append(buf, sizeof(buf), n, " >");
+                n = safe_append(buf, sizeof(buf), n, " %02X", b);
             }
-            n += snprintf(buf + n, sizeof(buf) - n, "\n");
+            n = safe_append(buf, sizeof(buf), n, "\n");
 
             // Sparse PC trace from this frame (every 4096th instruction).
             extern uint32_t arm_pc_trace[16], arm_pc_trace_pos;
@@ -635,11 +656,11 @@ int main(void) {
             // The BIOS at 0x134 does LDR pc,[0x03FFFFFC], and that mirrors
             // wram_chip[0x7FFC..0x7FFF] (IWRAM, 32 KB masked).
             uint32_t user_irq_handler = mem_swz_read_w(wram_chip, 0x7FFC);
-            n += snprintf(buf + n, sizeof(buf) - n,
+            n = safe_append(buf, sizeof(buf), n,
                 "*(0x03007FFC) = %08lX  (cart user IRQ handler)\n",
                 (unsigned long)user_irq_handler);
 
-            n += snprintf(buf + n, sizeof(buf) - n,
+            n = safe_append(buf, sizeof(buf), n,
                 "undef=%lu  1st-low PC=%08lX LR=%08lX op=%08lX thumb=%d\n"
                 "SWI last=%02X 01=%lu 02=%lu 04=%lu 05=%lu 06=%lu "
                 "0B=%lu 0C=%lu 0E=%lu 0F=%lu 11=%lu 12=%lu 13=%lu 14=%lu 15=%lu\n",
@@ -663,19 +684,19 @@ int main(void) {
                 (unsigned long)arm_swi_count[0x13],
                 (unsigned long)arm_swi_count[0x14],
                 (unsigned long)arm_swi_count[0x15]);
-            n += snprintf(buf + n, sizeof(buf) - n,
+            n = safe_append(buf, sizeof(buf), n,
                 "HLE IRQ entries (cumulative): %lu\n",
                 (unsigned long)arm_hle_irq_count);
-            n += snprintf(buf + n, sizeof(buf) - n, "PC trace (newest last):\n");
+            n = safe_append(buf, sizeof(buf), n, "PC trace (newest last):\n");
             uint32_t start = arm_pc_trace_pos > 16
                 ? arm_pc_trace_pos - 16 : 0;
             for (uint32_t k = start; k < arm_pc_trace_pos; k++) {
-                n += snprintf(buf + n, sizeof(buf) - n, " %08lX",
+                n = safe_append(buf, sizeof(buf), n, " %08lX",
                     (unsigned long)arm_pc_trace[k & 15]);
                 if ((k - start) % 4 == 3)
-                    n += snprintf(buf + n, sizeof(buf) - n, "\n");
+                    n = safe_append(buf, sizeof(buf), n, "\n");
             }
-            n += snprintf(buf + n, sizeof(buf) - n, "\n");
+            n = safe_append(buf, sizeof(buf), n, "\n");
 
             // Per-frame breakdown for THIS frame. Useful for spike snapshots
             // (the whole point is to see what's slow on the spike frame),
@@ -705,7 +726,7 @@ int main(void) {
             uint32_t ftss = bench_thumb_ss_inst         - tss_at_start;
             uint32_t ftbi = bench_thumb_block_inst      - tbi_at_start;
             uint32_t ftbd = bench_thumb_block_decodes   - tbd_at_start;
-            n += snprintf(buf + n, sizeof(buf) - n,
+            n = safe_append(buf, sizeof(buf), n,
                 "FRAME breakdown:\n"
                 "  arm_exec=%lu us  render=%lu us  dupdate=%lu us\n"
                 "  arm_mode=%lu us  thumb_mode=%lu us\n"
@@ -746,7 +767,7 @@ int main(void) {
                 uint32_t thbm_us = bench_freq_hz
                     ? (uint32_t)((bench_thumb_mode_ticks * 1000000ULL) / bench_freq_hz)
                     : 0;
-                n += snprintf(buf + n, sizeof(buf) - n,
+                n = safe_append(buf, sizeof(buf), n,
                     "BENCH (totals over %lu frames, freq=%lu Hz):\n"
                     "  arm_exec=%lu us (%lu/frame)\n"
                     "  render  =%lu us (%lu/frame)\n"
@@ -816,7 +837,7 @@ int main(void) {
                 bench_arm_legacy_inst = 0;
                 for (int hi = 0; hi < 16; hi++) bench_arm_legacy_hist[hi] = 0;
             }
-            n += snprintf(buf + n, sizeof(buf) - n, "\n");
+            n = safe_append(buf, sizeof(buf), n, "\n");
 
             FILE *log = fopen("fxgba_log.txt", "a");
             if (log) {
