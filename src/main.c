@@ -28,6 +28,7 @@
 #include "arm_block.h"
 #include "thumb_block.h"
 #include "extram.h"
+#include "sh4_jit.h"
 
 #include "io.h"
 
@@ -138,6 +139,11 @@ int main(void) {
     extram_init();
     ewram_init();
 
+    // Phase 0 JIT gate: emit `rts; nop` into a kmalloc buffer and call it.
+    // Must run before any later step that could mask a hang/panic. If we
+    // return from this call, W+X works on this configuration.
+    jit_spike_run();
+
 #if GBA_DIAG_LOG
     dclear(C_WHITE);
     dtext (1, 20, C_BLACK, "gdkGBA - Gameboy Advance emulator made by gdkchan");
@@ -146,6 +152,7 @@ int main(void) {
     dprint(1, 90, C_BLACK, "%s", extram_status);
     dprint(1,110, C_BLACK, "EWRAM: %u KB (mask 0x%05X)",
            (unsigned)(ewram_size / 1024), (unsigned)ewram_mask);
+    dprint(1,130, C_BLACK, "%s", jit_spike_status);
     dupdate();
 
     getkey();
@@ -310,6 +317,7 @@ int main(void) {
     dprint(1, 20, C_BLACK, "active chunks: %d/%d  (each %d KB)",
            rom_buffer.active_chunks, ROM_BUFFER_CHUNKS, ROM_CHUNK_SIZE / 1024);
     dprint(1, 40, C_BLACK, "%s", extram_status);
+    dprint(1, 60, C_BLACK, "%s", jit_spike_status);
     dupdate();
     getkey();
 #endif
@@ -362,6 +370,7 @@ int main(void) {
             extern uint8_t post_boot;
             fprintf(log, "POSTFLG at boot: %u\n", (unsigned)post_boot);
             fprintf(log, "BIOS bytes read: %u\n", (unsigned)bios_read);
+            fprintf(log, "%s (ok=%d)\n", jit_spike_status, jit_spike_ok);
 
             // Dump key Thumb decoder slots. If t16_blx_h1 was correctly
             // unregistered, slots 0x740-0x77F should equal arm_und.

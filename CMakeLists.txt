@@ -21,6 +21,7 @@ set(SOURCES
   src/io.c
   src/rom_buffer.c
   src/save_file.c
+  src/sh4_jit.c
   src/sound.c
   src/thumb_block.c
   src/timer.c
