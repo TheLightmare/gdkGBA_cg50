@@ -968,11 +968,11 @@ static void vcount_match() {
 // slowdown vs. FRAMESKIP=1 in Minish Cap gameplay -- arm_exec is the
 // bottleneck, render+dupdate fits comfortably in the per-frame budget.
 // Kept as a build switch in case a render-heavier game emerges.
-//   FRAMESKIP=0: render every frame   (current default)
-//   FRAMESKIP=1: render every other
+//   FRAMESKIP=0: render every frame
+//   FRAMESKIP=1: render every other      (current default)
 //   FRAMESKIP=2: render 1 in 3
 #ifndef FRAMESKIP
-#define FRAMESKIP 0
+#define FRAMESKIP 1
 #endif
 
 void run_frame() {
