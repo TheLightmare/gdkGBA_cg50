@@ -4190,6 +4190,89 @@ uint32_t arm_jit_ror_v(uint32_t val, uint32_t sh) {
     return (val >> sh) | (val << (32u - sh));
 }
 
+// ---- Phase 2 chunk 5: cout-shifters + S=1 logic ops ----------------------
+//
+// Cout-shifter helpers: same shape as the _v variants but also write
+// arm_flag_c to the bit that "fell off" -- which is what the ARM
+// shifter-cout signal feeds into for logic ops with the S bit set.
+//
+//   LSL imm:    cout = bit (32 - imm) of val
+//   LSR/ASR/ROR imm: cout = bit (imm - 1) of val
+//
+// The recogniser guarantees sh in [1, 31]; the special encodings (LSR #32,
+// ASR #32, RRX) still fall through to legacy.
+
+uint32_t arm_jit_lsl_vc(uint32_t val, uint32_t sh) {
+    arm_flag_c = (val >> (32u - sh)) & 1u;
+    return val << sh;
+}
+
+uint32_t arm_jit_lsr_vc(uint32_t val, uint32_t sh) {
+    arm_flag_c = (val >> (sh - 1u)) & 1u;
+    return val >> sh;
+}
+
+uint32_t arm_jit_asr_vc(uint32_t val, uint32_t sh) {
+    arm_flag_c = (val >> (sh - 1u)) & 1u;
+    return (uint32_t)((int32_t)val >> sh);
+}
+
+uint32_t arm_jit_ror_vc(uint32_t val, uint32_t sh) {
+    arm_flag_c = (val >> (sh - 1u)) & 1u;
+    return (val >> sh) | (val << (32u - sh));
+}
+
+// S=1 logic op helpers. Write result to r0 and set N/Z. arm_flag_c was
+// either pre-set by a cout-shifter (shifted form) or is preserved
+// untouched (no-shift form, where the legacy "cout = arm_flag_c"
+// invariant means leaving the existing value is correct). V is unchanged.
+//
+// MOVS/MVNS ignore the lhs operand; the JIT still loads it into r4 for a
+// uniform call shape -- harmless since the helper drops it on the floor.
+
+uint32_t arm_jit_ands(uint32_t lhs, uint32_t rhs) {
+    uint32_t res = lhs & rhs;
+    arm_flag_n = res >> 31;
+    arm_flag_z = (res == 0);
+    return res;
+}
+
+uint32_t arm_jit_eors(uint32_t lhs, uint32_t rhs) {
+    uint32_t res = lhs ^ rhs;
+    arm_flag_n = res >> 31;
+    arm_flag_z = (res == 0);
+    return res;
+}
+
+uint32_t arm_jit_orrs(uint32_t lhs, uint32_t rhs) {
+    uint32_t res = lhs | rhs;
+    arm_flag_n = res >> 31;
+    arm_flag_z = (res == 0);
+    return res;
+}
+
+uint32_t arm_jit_bics(uint32_t lhs, uint32_t rhs) {
+    uint32_t res = lhs & ~rhs;
+    arm_flag_n = res >> 31;
+    arm_flag_z = (res == 0);
+    return res;
+}
+
+uint32_t arm_jit_movs(uint32_t lhs_unused, uint32_t rhs) {
+    (void)lhs_unused;
+    arm_flag_n = rhs >> 31;
+    arm_flag_z = (rhs == 0);
+    return rhs;
+}
+
+uint32_t arm_jit_mvns(uint32_t lhs_unused, uint32_t rhs) {
+    (void)lhs_unused;
+    uint32_t res = ~rhs;
+    arm_flag_n = res >> 31;
+    arm_flag_z = (res == 0);
+    return res;
+}
+
 void arm_init() {
     // Initialize memory buffer contents, not the pointers themselves
     // as they are already declared as arrays

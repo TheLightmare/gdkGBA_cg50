@@ -61,6 +61,20 @@ extern uint32_t arm_jit_lsr_v(uint32_t val, uint32_t sh);
 extern uint32_t arm_jit_asr_v(uint32_t val, uint32_t sh);
 extern uint32_t arm_jit_ror_v(uint32_t val, uint32_t sh);
 
+// Phase 2 chunk 5 cout-shifter helpers (write arm_flag_c to shifter-out).
+extern uint32_t arm_jit_lsl_vc(uint32_t val, uint32_t sh);
+extern uint32_t arm_jit_lsr_vc(uint32_t val, uint32_t sh);
+extern uint32_t arm_jit_asr_vc(uint32_t val, uint32_t sh);
+extern uint32_t arm_jit_ror_vc(uint32_t val, uint32_t sh);
+
+// Phase 2 chunk 5 S=1 logic-op helpers (set N/Z, leave C from shifter).
+extern uint32_t arm_jit_ands(uint32_t lhs, uint32_t rhs);
+extern uint32_t arm_jit_eors(uint32_t lhs, uint32_t rhs);
+extern uint32_t arm_jit_orrs(uint32_t lhs, uint32_t rhs);
+extern uint32_t arm_jit_bics(uint32_t lhs, uint32_t rhs);
+extern uint32_t arm_jit_movs(uint32_t lhs_unused, uint32_t rhs);
+extern uint32_t arm_jit_mvns(uint32_t lhs_unused, uint32_t rhs);
+
 static size_t estimate_block_bytes(uint16_t length) {
     // Worst case per uop: cond-checked BL imm24 = 6 (cond prefix) +
     // 12 (body) = 18 SH4 instructions = 36 B + 3 literals = ~48 B.
@@ -309,19 +323,44 @@ static bool emit_arm_dp_reg(uint8_t cond, uint32_t op, int kind) {
 
 static void *arm_dp_reg_s1_helper(uint8_t opc) {
     switch (opc) {
+        case 0x0: return (void *)&arm_jit_ands;   // ANDS Rd, Rn, Rm
+        case 0x1: return (void *)&arm_jit_eors;   // EORS Rd, Rn, Rm
         case 0x2: return (void *)&arm_jit_subs;   // SUBS Rd, Rn, Rm
         case 0x4: return (void *)&arm_jit_adds;   // ADDS Rd, Rn, Rm
         case 0x8: return (void *)&arm_jit_tst;    // TST Rn, Rm   (no Rd)
         case 0x9: return (void *)&arm_jit_teq;    // TEQ Rn, Rm   (no Rd)
         case 0xA: return (void *)&arm_jit_cmp;    // CMP Rn, Rm   (no Rd)
         case 0xB: return (void *)&arm_jit_cmn;    // CMN Rn, Rm   (no Rd)
+        case 0xC: return (void *)&arm_jit_orrs;   // ORRS Rd, Rn, Rm
+        case 0xD: return (void *)&arm_jit_movs;   // MOVS Rd, Rm   (Rn ignored)
+        case 0xE: return (void *)&arm_jit_bics;   // BICS Rd, Rn, Rm
+        case 0xF: return (void *)&arm_jit_mvns;   // MVNS Rd, Rm   (Rn ignored)
         default:  return NULL;
     }
 }
 
 static bool opc_writes_dest_s1(uint8_t opc) {
-    // ADDS / SUBS write to Rd; TST/TEQ/CMP/CMN don't.
-    return opc == 0x2 || opc == 0x4;
+    // TST/TEQ/CMP/CMN do not write Rd. All other S=1 ops do.
+    return !(opc == 0x8 || opc == 0x9 || opc == 0xA || opc == 0xB);
+}
+
+// Phase 2 chunk 5: S=1 logic ops use the cout-shifter so arm_flag_c
+// reflects the shifter output. S=1 arith ops (ADDS/SUBS/CMP/CMN) compute
+// C from arithmetic; the shifter cout is irrelevant for them.
+static bool opc_s1_uses_shifter_cout(uint8_t opc) {
+    switch (opc) {
+        case 0x0:  // ANDS
+        case 0x1:  // EORS
+        case 0x8:  // TST
+        case 0x9:  // TEQ
+        case 0xC:  // ORRS
+        case 0xD:  // MOVS
+        case 0xE:  // BICS
+        case 0xF:  // MVNS
+            return true;
+        default:
+            return false;
+    }
 }
 
 static int emit_arm_dp_reg_s1_size(uint8_t opc) {
@@ -356,7 +395,16 @@ static bool emit_arm_dp_reg_s1_body(uint8_t opc, uint8_t rn, uint8_t rd, uint8_t
 //   jsr  @r0
 //   nop                          ; delay slot; r0 := shifted_Rm on return
 
-static void *arm_dp_reg_shifter(uint8_t shift_type) {
+static void *arm_dp_reg_shifter(uint8_t shift_type, bool with_cout) {
+    if (with_cout) {
+        switch (shift_type) {
+            case 0: return (void *)&arm_jit_lsl_vc;
+            case 1: return (void *)&arm_jit_lsr_vc;
+            case 2: return (void *)&arm_jit_asr_vc;
+            case 3: return (void *)&arm_jit_ror_vc;
+            default: return NULL;
+        }
+    }
     switch (shift_type) {
         case 0: return (void *)&arm_jit_lsl_v;
         case 1: return (void *)&arm_jit_lsr_v;
@@ -366,8 +414,9 @@ static void *arm_dp_reg_shifter(uint8_t shift_type) {
     }
 }
 
-static bool emit_arm_shift_preamble(uint8_t rm, uint8_t shift_type, uint8_t shift_imm) {
-    void *helper = arm_dp_reg_shifter(shift_type);
+static bool emit_arm_shift_preamble(uint8_t rm, uint8_t shift_type,
+                                    uint8_t shift_imm, bool with_cout) {
+    void *helper = arm_dp_reg_shifter(shift_type, with_cout);
     if (!helper) return false;
     emit_movl_disp_rm_rn(rm, 8, 4);
     emit_mov_imm_rn((int8_t)shift_imm, 5);
@@ -407,7 +456,11 @@ static int emit_arm_dp_reg_shifted_size(uint8_t opc, int kind) {
 static bool emit_arm_dp_reg_shifted_body(uint8_t opc, uint8_t rn, uint8_t rd,
                                          uint8_t rm, uint8_t shift_type,
                                          uint8_t shift_imm, int kind) {
-    if (!emit_arm_shift_preamble(rm, shift_type, shift_imm)) return false;
+    // S=1 logic ops need the shifter cout staged into arm_flag_c so the
+    // op helper (which only sets N/Z) leaves C reflecting the shifter.
+    // S=0 ops and S=1 arith ops use the value-only shifter.
+    bool with_cout = (kind == 4) && opc_s1_uses_shifter_cout(opc);
+    if (!emit_arm_shift_preamble(rm, shift_type, shift_imm, with_cout)) return false;
 
     if (kind == 3) {
         // S=0 inline body. r0 = shifted Rm post-helper.
@@ -498,16 +551,26 @@ static int arm_dp_reg_kind(uint32_t op) {
         }
     }
     // S=1: helper-call body. Chunk 3 (no-shift) or chunk 4 (shifted).
-    // Shifted TST/TEQ would need cout staging into arm_flag_c -- defer.
+    // Chunk 5 extends this to S=1 logic ops; the shifted-body emitter
+    // picks the cout-shifter for those so arm_flag_c reflects the
+    // shifter output (logic-op semantics).
+    //
+    // Deferred: ADC/SBC/RSC (need C-flag input) and RSBS (arith with
+    // swapped operands; helper not yet provided).
     switch (opc) {
+        case 0x0:  // ANDS
+        case 0x1:  // EORS
         case 0x2:  // SUBS
         case 0x4:  // ADDS
-        case 0xA:  // CMP
-        case 0xB:  // CMN
-            return shifted ? 4 : 2;
         case 0x8:  // TST
         case 0x9:  // TEQ
-            return shifted ? 0 : 2;
+        case 0xA:  // CMP
+        case 0xB:  // CMN
+        case 0xC:  // ORRS
+        case 0xD:  // MOVS
+        case 0xE:  // BICS
+        case 0xF:  // MVNS
+            return shifted ? 4 : 2;
         default:
             return 0;
     }
