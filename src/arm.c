@@ -4092,6 +4092,75 @@ void arm_dec_str_imm12(const arm_uop_t *uop) {
     arm_memio_str(op);
 }
 
+// ---- Phase 2 chunk 3: JIT flag-update helpers ----------------------------
+//
+// These are called from JIT'd blocks when the recogniser hits the S=1 form
+// of ARM data-proc REG with no shift. The JIT emits load Rn into r4, load
+// Rm into r5, jsr to one of these helpers. Helpers compute the flag mask
+// from the supplied (lhs, rhs) and stash it in the four arm_flag_* globals
+// using the same formulas as the legacy arm_arith_*/arm_logic_* path.
+//
+// ADDS/SUBS return the result in r0 so the caller can store it into Rd.
+// CMP/CMN/TST/TEQ are flag-only -- they have no destination register.
+//
+// Kept as plain extern void/uint32_t so the JIT can reference them by
+// taking their address. No new symbols on the per-uop indirect-call path
+// the interpreter uses, so the I-cache regression that bit Phase 1
+// attempt #2 doesn't apply here.
+
+void arm_jit_cmp(uint32_t lhs, uint32_t rhs) {
+    uint64_t res64 = (uint64_t)lhs - rhs;
+    uint32_t res   = (uint32_t)res64;
+    arm_flag_n = res >> 31;
+    arm_flag_z = (res == 0);
+    arm_flag_c = (res64 < 0x100000000ULL);
+    arm_flag_v = (((lhs ^ rhs) & (lhs ^ res)) >> 31) & 1;
+}
+
+void arm_jit_cmn(uint32_t lhs, uint32_t rhs) {
+    uint64_t res64 = (uint64_t)lhs + rhs;
+    uint32_t res   = (uint32_t)res64;
+    arm_flag_n = res >> 31;
+    arm_flag_z = (res == 0);
+    arm_flag_c = (res64 > 0xffffffffULL);
+    arm_flag_v = ((~(lhs ^ rhs) & (lhs ^ res)) >> 31) & 1;
+}
+
+// TST/TEQ: logical-set semantics for no-shift. C comes from the shifter,
+// which for shift_imm=0 LSL is the preserved arm_flag_c -- so we leave
+// it alone. V is also untouched on logic ops.
+void arm_jit_tst(uint32_t lhs, uint32_t rhs) {
+    uint32_t res = lhs & rhs;
+    arm_flag_n = res >> 31;
+    arm_flag_z = (res == 0);
+}
+
+void arm_jit_teq(uint32_t lhs, uint32_t rhs) {
+    uint32_t res = lhs ^ rhs;
+    arm_flag_n = res >> 31;
+    arm_flag_z = (res == 0);
+}
+
+uint32_t arm_jit_adds(uint32_t lhs, uint32_t rhs) {
+    uint64_t res64 = (uint64_t)lhs + rhs;
+    uint32_t res   = (uint32_t)res64;
+    arm_flag_n = res >> 31;
+    arm_flag_z = (res == 0);
+    arm_flag_c = (res64 > 0xffffffffULL);
+    arm_flag_v = ((~(lhs ^ rhs) & (lhs ^ res)) >> 31) & 1;
+    return res;
+}
+
+uint32_t arm_jit_subs(uint32_t lhs, uint32_t rhs) {
+    uint64_t res64 = (uint64_t)lhs - rhs;
+    uint32_t res   = (uint32_t)res64;
+    arm_flag_n = res >> 31;
+    arm_flag_z = (res == 0);
+    arm_flag_c = (res64 < 0x100000000ULL);
+    arm_flag_v = (((lhs ^ rhs) & (lhs ^ res)) >> 31) & 1;
+    return res;
+}
+
 void arm_init() {
     // Initialize memory buffer contents, not the pointers themselves
     // as they are already declared as arrays
