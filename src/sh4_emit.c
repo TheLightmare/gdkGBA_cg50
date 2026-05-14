@@ -80,6 +80,31 @@ void emit_add_rr(uint8_t rm, uint8_t rn) {
     jit_emit16((uint16_t)(0x300C | (R(rn) << 8) | (R(rm) << 4)));
 }
 
+void emit_sub_rr(uint8_t rm, uint8_t rn) {
+    // sub Rm, Rn   :   0011 nnnn mmmm 1000   (Rn -= Rm, no flags)
+    jit_emit16((uint16_t)(0x3008 | (R(rn) << 8) | (R(rm) << 4)));
+}
+
+void emit_and_rr(uint8_t rm, uint8_t rn) {
+    // and Rm, Rn   :   0010 nnnn mmmm 1001
+    jit_emit16((uint16_t)(0x2009 | (R(rn) << 8) | (R(rm) << 4)));
+}
+
+void emit_or_rr(uint8_t rm, uint8_t rn) {
+    // or Rm, Rn    :   0010 nnnn mmmm 1011
+    jit_emit16((uint16_t)(0x200B | (R(rn) << 8) | (R(rm) << 4)));
+}
+
+void emit_xor_rr(uint8_t rm, uint8_t rn) {
+    // xor Rm, Rn   :   0010 nnnn mmmm 1010
+    jit_emit16((uint16_t)(0x200A | (R(rn) << 8) | (R(rm) << 4)));
+}
+
+void emit_not_rr(uint8_t rm, uint8_t rn) {
+    // not Rm, Rn   :   0110 nnnn mmmm 0111   (Rn = ~Rm)
+    jit_emit16((uint16_t)(0x6007 | (R(rn) << 8) | (R(rm) << 4)));
+}
+
 void emit_tst_rr(uint8_t rm, uint8_t rn) {
     // tst Rm, Rn   :   0010 nnnn mmmm 1000
     jit_emit16((uint16_t)(0x2008 | (R(rn) << 8) | (R(rm) << 4)));

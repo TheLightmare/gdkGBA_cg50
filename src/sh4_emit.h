@@ -44,6 +44,11 @@ void emit_extub_rm_rn(uint8_t rm, uint8_t rn);
 void emit_mov_imm_rn(int8_t imm, uint8_t rn);       // mov #imm, Rn   (signed 8)
 void emit_add_imm_rn(int8_t imm, uint8_t rn);       // add #imm, Rn   (signed 8)
 void emit_add_rr    (uint8_t rm, uint8_t rn);        // add Rm, Rn     (reg+reg, no flags)
+void emit_sub_rr    (uint8_t rm, uint8_t rn);        // sub Rm, Rn     (Rn -= Rm, no flags)
+void emit_and_rr    (uint8_t rm, uint8_t rn);        // and Rm, Rn     (Rn &= Rm)
+void emit_or_rr     (uint8_t rm, uint8_t rn);        // or  Rm, Rn     (Rn |= Rm)
+void emit_xor_rr    (uint8_t rm, uint8_t rn);        // xor Rm, Rn     (Rn ^= Rm)
+void emit_not_rr    (uint8_t rm, uint8_t rn);        // not Rm, Rn     (Rn  = ~Rm)
 void emit_tst_rr    (uint8_t rm, uint8_t rn);        // tst Rm, Rn
 
 // Shifts (T flag set to outgoing bit; we ignore T for these uses).

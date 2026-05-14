@@ -39,9 +39,10 @@ extern uint32_t bench_arm_jit_specialized_ops;
 
 // Handlers we specialise inline. Declared locally to avoid pulling
 // every arm_dec_* declaration into the header.
-extern void arm_dec_b_imm24 (const arm_uop_t *uop);
-extern void arm_dec_bl_imm24(const arm_uop_t *uop);
-extern void arm_dec_mov_imm (const arm_uop_t *uop);
+extern void arm_dec_b_imm24    (const arm_uop_t *uop);
+extern void arm_dec_bl_imm24   (const arm_uop_t *uop);
+extern void arm_dec_mov_imm    (const arm_uop_t *uop);
+extern void arm_dec_call_legacy(const arm_uop_t *uop);
 
 static size_t estimate_block_bytes(uint16_t length) {
     // Worst case per uop: cond-checked BL imm24 = 6 (cond prefix) +
@@ -161,6 +162,118 @@ static bool emit_arm_mov_imm(uint8_t cond, uint8_t rd, uint32_t imm) {
     return emit_arm_mov_imm_body(rd, imm);
 }
 
+// Phase 2 Chunk 1: inline ARM data-proc REG form, no-shift / S=0 subset.
+//
+// The interpreter has no specialised handler for these -- they all
+// route through arm_dec_call_legacy. The JIT recognises the pattern
+// straight from uop->raw_op and emits inline native code, which
+// bypasses the whole arm_proc_handlers[] dispatch + helper-call cost
+// the legacy path pays per op.
+//
+// Pattern (cond field already in uop->cond):
+//   bits 27..25 = 0b000     -- data-proc / misc group
+//   bits 11..4  = 0b00000000-- LSL #0 (no shift), imm-shift form
+//   bit 20      = 0         -- S=0 (flag-update variants deferred to chunk 3)
+//   opc (24..21) in supported set (excludes ADC/SBC/RSC -- need C flag,
+//                                  excludes TST/TEQ/CMP/CMN -- always S=1)
+//   Rd (15..12) != 15       -- data-proc Rd=15 ends the block; let the
+//                              legacy path drive pipe_reload
+//
+// Body register usage:
+//   r0 = first operand / result accumulator
+//   r1 = second operand / scratch
+// All loads/stores go through r8 = &arm_r as elsewhere.
+
+static int emit_arm_dp_reg_size(uint8_t opc) {
+    switch (opc) {
+        case 0xD: return 2;   // MOV  Rd, Rm
+        case 0xF: return 3;   // MVN  Rd, Rm
+        case 0xE: return 5;   // BIC  Rd, Rn, Rm
+        default:  return 4;   // AND/EOR/SUB/RSB/ADD/ORR
+    }
+}
+
+static void emit_arm_dp_reg_body(uint8_t opc, uint8_t rn, uint8_t rd, uint8_t rm) {
+    if (opc == 0xD) {                      // MOV Rd, Rm
+        emit_movl_disp_rm_rn(rm, 8, 0);
+        emit_movl_rm_disp_rn(0, rd, 8);
+        return;
+    }
+    if (opc == 0xF) {                      // MVN Rd, Rm
+        emit_movl_disp_rm_rn(rm, 8, 0);
+        emit_not_rr(0, 0);
+        emit_movl_rm_disp_rn(0, rd, 8);
+        return;
+    }
+    // 3-operand: load Rn into r0, Rm into r1.
+    emit_movl_disp_rm_rn(rn, 8, 0);
+    emit_movl_disp_rm_rn(rm, 8, 1);
+
+    switch (opc) {
+        case 0x0:  // AND  Rd = Rn & Rm
+            emit_and_rr(1, 0);
+            break;
+        case 0x1:  // EOR  Rd = Rn ^ Rm
+            emit_xor_rr(1, 0);
+            break;
+        case 0x2:  // SUB  Rd = Rn - Rm
+            emit_sub_rr(1, 0);
+            break;
+        case 0x3:  // RSB  Rd = Rm - Rn   (sub Rn from Rm, leave result in r1)
+            emit_sub_rr(0, 1);
+            emit_movl_rm_disp_rn(1, rd, 8);
+            return;
+        case 0x4:  // ADD  Rd = Rn + Rm
+            emit_add_rr(1, 0);
+            break;
+        case 0xC:  // ORR  Rd = Rn | Rm
+            emit_or_rr(1, 0);
+            break;
+        case 0xE:  // BIC  Rd = Rn & ~Rm
+            emit_not_rr(1, 1);
+            emit_and_rr(1, 0);
+            break;
+    }
+    emit_movl_rm_disp_rn(0, rd, 8);
+}
+
+static bool emit_arm_dp_reg(uint8_t cond, uint32_t op) {
+    uint8_t opc = (op >> 21) & 0xF;
+    uint8_t rn  = (op >> 16) & 0xF;
+    uint8_t rd  = (op >> 12) & 0xF;
+    uint8_t rm  =  op        & 0xF;
+
+    int body_size = emit_arm_dp_reg_size(opc);
+
+    if (cond != 14) {
+        if (!emit_arm_cond_check_prefix(cond)) return false;
+        emit_bt((int16_t)(body_size - 1));
+    }
+    emit_arm_dp_reg_body(opc, rn, rd, rm);
+    return true;
+}
+
+static bool arm_dp_reg_recognized(uint32_t op) {
+    if (((op >> 25) & 0x7) != 0) return false;        // group 0b000
+    if (((op >> 4)  & 0xFF) != 0) return false;        // LSL #0, imm-shift form
+    if (((op >> 20) & 0x1) != 0) return false;         // S = 0
+    if (((op >> 12) & 0xF) == 15) return false;        // Rd != 15
+    switch ((op >> 21) & 0xF) {
+        case 0x0:  // AND
+        case 0x1:  // EOR
+        case 0x2:  // SUB
+        case 0x3:  // RSB
+        case 0x4:  // ADD
+        case 0xC:  // ORR
+        case 0xD:  // MOV
+        case 0xE:  // BIC
+        case 0xF:  // MVN
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Dispatch one uop. Returns SPECIALISED, FALLBACK_OK, or FAIL.
 enum emit_result { EMIT_SPECIALISED, EMIT_FALLBACK, EMIT_FAIL };
 
@@ -180,6 +293,13 @@ static enum emit_result arm_emit_one_uop(const arm_uop_t *uop) {
     }
     if (uop->handler == arm_dec_mov_imm) {
         if (!emit_arm_mov_imm(uop->cond, uop->arg_b, uop->arg_c)) return EMIT_FAIL;
+        return EMIT_SPECIALISED;
+    }
+    // Phase 2 chunk 1: JIT-only recognition of data-proc REG (no-shift,
+    // S=0). The interpreter routes these through arm_dec_call_legacy;
+    // we intercept on the JIT side by inspecting raw_op.
+    if (uop->handler == arm_dec_call_legacy && arm_dp_reg_recognized(uop->raw_op)) {
+        if (!emit_arm_dp_reg(uop->cond, uop->raw_op)) return EMIT_FAIL;
         return EMIT_SPECIALISED;
     }
     if (!emit_jsr_fallback(uop)) return EMIT_FAIL;
