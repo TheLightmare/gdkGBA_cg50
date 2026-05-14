@@ -32,6 +32,9 @@ uint32_t bench_thumb_block_decodes;
 uint32_t bench_arm_legacy_inst;
 uint32_t bench_arm_legacy_hist[16];
 
+uint32_t bench_thumb_legacy_inst;
+uint32_t bench_thumb_legacy_hist[16];
+
 static int bench_tmu_id = -1;
 static uint32_t bench_tcor;
 

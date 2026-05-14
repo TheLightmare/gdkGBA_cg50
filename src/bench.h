@@ -87,6 +87,30 @@ extern uint32_t bench_thumb_block_decodes;
 extern uint32_t bench_arm_legacy_inst;
 extern uint32_t bench_arm_legacy_hist[16];
 
+// Same coverage gauge for Thumb. There's no thumb-mode equivalent to
+// arm_dec_call_legacy that we instrumented previously, so until this
+// counter existed we had no visibility into the Thumb block-cache
+// coverage. Bucketed on (raw_op >> 12) & 0xF -- bits 15..12 of the
+// 16-bit Thumb opcode, which cleanly partition the encoding tree:
+//   0x0 = LSL/LSR/ASR Rd, Rm, #imm5 ; ADD/SUB reg or imm3
+//   0x1 = ditto (top5 continuation)
+//   0x2 = MOV/CMP Rd, #imm8
+//   0x3 = ADD/SUB Rd, #imm8
+//   0x4 = data-proc reg, special data, BX/BLX reg, LDR PC-rel
+//   0x5 = LDR/STR/STRH/LDRH/LDRSB/LDRSH (register offset)
+//   0x6 = LDR/STR Rd, [Rn, #imm5*4]
+//   0x7 = LDRB/STRB Rd, [Rn, #imm5]
+//   0x8 = LDRH/STRH Rd, [Rn, #imm5*2]
+//   0x9 = LDR/STR Rd, [SP, #imm8*4]
+//   0xA = ADD Rd, PC/SP, #imm8*4
+//   0xB = misc (PUSH/POP, ADD/SUB SP, etc.)
+//   0xC = LDM/STM
+//   0xD = conditional B / SWI
+//   0xE = unconditional B / BLX prefix
+//   0xF = BL prefix/suffix
+extern uint32_t bench_thumb_legacy_inst;
+extern uint32_t bench_thumb_legacy_hist[16];
+
 #else  // !GBA_BENCH
 
 // Release builds: bench is fully compiled out. Provide an inline no-op

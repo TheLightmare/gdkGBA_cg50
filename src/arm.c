@@ -3930,6 +3930,8 @@ void t16_dec_b_imm11(const thumb_uop_t *uop) {
 // effect as Phase 4a's executor, just routed through the new handler
 // signature.
 void t16_dec_call_legacy(const thumb_uop_t *uop) {
+    BENCH_INC(bench_thumb_legacy_inst);
+    BENCH_INC(bench_thumb_legacy_hist[(uop->raw_op >> 12) & 0xF]);
     arm_op = uop->raw_op;
     thumb_proc[uop->raw_op >> 5]();
 }
