@@ -21,9 +21,14 @@
 // blocks before gameplay code arrives. Deferring until the block
 // proves hot leaves arena room for the code that actually matters.
 //
-// 4 is a starting threshold: enough to skip true one-shot init code,
-// low enough that warm code gets JIT'd within a frame or two.
-#define JIT_HOT_THRESHOLD 4u
+// Chunk 8 redo: threshold 4 caused a "warmup tax" regression on the
+// HALT-loop path -- page-gen invalidation drops a previously-JIT'd
+// block, the block is re-decoded with exec_count=0, and pays N more
+// uop-list executions before re-JIT'ing. With ~475 thumb_blk_decodes
+// per frame in invalidation-heavy paths, the per-decode tax adds up.
+// Threshold 2 halves it while still filtering true one-shot blocks
+// (1-execution code never reaches threshold).
+#define JIT_HOT_THRESHOLD 2u
 
 #include "io.h"
 #include "timer.h"
