@@ -50,9 +50,15 @@ extern bool int_halt;
 extern void t16_dec_mov_imm8(const thumb_uop_t *uop);
 extern void t16_dec_b_imm11(const thumb_uop_t *uop);
 extern void t16_dec_b_cond (const thumb_uop_t *uop);
-extern void t16_dec_ldr_imm5(const thumb_uop_t *uop);
-extern void t16_dec_str_imm5(const thumb_uop_t *uop);
-extern void t16_dec_ldr_pc8 (const thumb_uop_t *uop);
+extern void t16_dec_ldr_imm5 (const thumb_uop_t *uop);
+extern void t16_dec_str_imm5 (const thumb_uop_t *uop);
+extern void t16_dec_ldr_pc8  (const thumb_uop_t *uop);
+extern void t16_dec_ldrb_imm5(const thumb_uop_t *uop);
+extern void t16_dec_strb_imm5(const thumb_uop_t *uop);
+
+// Phase 2 chunk 7: byte memory helpers for inline LDRB/STRB emit.
+extern uint8_t arm_readb_n (uint32_t address);
+extern void    arm_writeb_n(uint32_t address, uint8_t value);
 
 // ----- Internal helpers ----------------------------------------------------
 
@@ -222,6 +228,39 @@ static bool emit_thumb_str_imm5(uint8_t rt, uint8_t rn, uint16_t imm) {
     return true;
 }
 
+// Phase 2 chunk 7: Thumb LDRB Rd, [Rn, #imm5] (byte offset, 0..31).
+// arg_a=Rd, arg_b=Rn, arg_c=imm5. arm_readb_n returns uint8_t; we
+// extu.b the result before storing so high bits of arm_r.r[Rd] are
+// zero (matches arm_r.r[op.rt] = arm_readb_n(op.addr) in the legacy
+// path -- the assignment widens uint8_t -> uint32_t with zero ext).
+// 8 SH4 instructions + 1 literal.
+static bool emit_thumb_ldrb_imm5(uint8_t rd, uint8_t rn, uint16_t imm) {
+    emit_movl_disp_rm_rn((uint8_t)(rn & 0xF), 8, 0);        // r0 = arm_r.r[Rn]
+    emit_add_imm_rn((int8_t)imm, 0);                         // r0 += imm
+    emit_mov_rr(0, 4);                                       // r4 = address
+    if (!emit_movl_pc_lit((uint32_t)(uintptr_t)&arm_readb_n, 0)) return false;
+    emit_jsr_at_rn(0);
+    emit_nop();
+    emit_extub_rm_rn(0, 0);                                  // r0 = (uint8_t)r0
+    emit_movl_rm_disp_rn(0, (uint8_t)(rd & 0xF), 8);         // arm_r.r[Rd] = r0
+    return true;
+}
+
+// Phase 2 chunk 7: Thumb STRB Rd, [Rn, #imm5]. arm_writeb_n takes
+// (addr, value) in r4/r5; the helper's uint8_t parameter means the
+// SH4 calling convention narrows r5 implicitly, so no extu.b needed
+// on the caller side. 7 SH4 instructions + 1 literal.
+static bool emit_thumb_strb_imm5(uint8_t rt, uint8_t rn, uint16_t imm) {
+    emit_movl_disp_rm_rn((uint8_t)(rn & 0xF), 8, 0);        // r0 = arm_r.r[Rn]
+    emit_add_imm_rn((int8_t)imm, 0);                         // r0 += imm
+    emit_mov_rr(0, 4);                                       // r4 = address
+    emit_movl_disp_rm_rn((uint8_t)(rt & 0xF), 8, 5);        // r5 = arm_r.r[Rt]
+    if (!emit_movl_pc_lit((uint32_t)(uintptr_t)&arm_writeb_n, 0)) return false;
+    emit_jsr_at_rn(0);
+    emit_nop();
+    return true;
+}
+
 // Thumb LDR Rd, [PC, #imm8*4] (arg_a = Rd, arg_c = imm8*4 in 0..1020).
 // Address = (arm_r.r[15] & ~3) + imm. R15 here is the interpreter's
 // usual "inst_pc + 4" -- the JIT increments R15 between uops, so by the
@@ -272,6 +311,14 @@ static enum emit_result emit_one_uop(const thumb_uop_t *uop) {
     }
     if (uop->handler == t16_dec_str_imm5) {
         if (!emit_thumb_str_imm5(uop->arg_a, uop->arg_b, uop->arg_c)) return EMIT_FAIL;
+        return EMIT_SPECIALISED;
+    }
+    if (uop->handler == t16_dec_ldrb_imm5) {
+        if (!emit_thumb_ldrb_imm5(uop->arg_a, uop->arg_b, uop->arg_c)) return EMIT_FAIL;
+        return EMIT_SPECIALISED;
+    }
+    if (uop->handler == t16_dec_strb_imm5) {
+        if (!emit_thumb_strb_imm5(uop->arg_a, uop->arg_b, uop->arg_c)) return EMIT_FAIL;
         return EMIT_SPECIALISED;
     }
     if (uop->handler == t16_dec_ldr_pc8) {

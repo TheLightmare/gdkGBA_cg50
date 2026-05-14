@@ -91,6 +91,8 @@ extern void t16_dec_lsr_imm5 (const thumb_uop_t *uop);
 extern void t16_dec_asr_imm5 (const thumb_uop_t *uop);
 extern void t16_dec_ldr_imm5 (const thumb_uop_t *uop);
 extern void t16_dec_str_imm5 (const thumb_uop_t *uop);
+extern void t16_dec_ldrb_imm5(const thumb_uop_t *uop);
+extern void t16_dec_strb_imm5(const thumb_uop_t *uop);
 extern void t16_dec_ldr_pc8  (const thumb_uop_t *uop);
 extern void t16_dec_add_imm3 (const thumb_uop_t *uop);
 extern void t16_dec_sub_imm3 (const thumb_uop_t *uop);
@@ -191,6 +193,18 @@ static void decode_thumb_op(uint16_t op, thumb_uop_t *out) {
             out->arg_a   = op & 0x7;
             out->arg_b   = (op >> 3) & 0x7;
             out->arg_c   = (uint16_t)(((op >> 6) & 0x1f) << 2);
+            return;
+        case 0b01110:  // STRB Rd, [Rn, #imm5]   (Phase 2 chunk 7)
+            out->handler = t16_dec_strb_imm5;
+            out->arg_a   = op & 0x7;
+            out->arg_b   = (op >> 3) & 0x7;
+            out->arg_c   = (uint16_t)((op >> 6) & 0x1f);
+            return;
+        case 0b01111:  // LDRB Rd, [Rn, #imm5]
+            out->handler = t16_dec_ldrb_imm5;
+            out->arg_a   = op & 0x7;
+            out->arg_b   = (op >> 3) & 0x7;
+            out->arg_c   = (uint16_t)((op >> 6) & 0x1f);
             return;
         case 0b11010:
         case 0b11011: {

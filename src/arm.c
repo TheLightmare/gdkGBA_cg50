@@ -3866,6 +3866,25 @@ void t16_dec_str_imm5(const thumb_uop_t *uop) {
     arm_memio_str(op);
 }
 
+// LDRB Rd, [Rn, #imm5] -- Phase 2 chunk 7. arg_a=Rd, arg_b=Rn,
+// arg_c=imm5 (unscaled byte offset, 0..31).
+void t16_dec_ldrb_imm5(const thumb_uop_t *uop) {
+    arm_memio_t op = {
+        .rt   = uop->arg_a,
+        .addr = arm_r.r[uop->arg_b] + uop->arg_c,
+    };
+    arm_memio_ldrb(op);
+}
+
+// STRB Rd, [Rn, #imm5] -- same operand layout as LDRB.
+void t16_dec_strb_imm5(const thumb_uop_t *uop) {
+    arm_memio_t op = {
+        .rt   = uop->arg_a,
+        .addr = arm_r.r[uop->arg_b] + uop->arg_c,
+    };
+    arm_memio_strb(op);
+}
+
 // LDR Rd, [PC, #imm8*4] -- constant pool access. Address depends on
 // runtime R15 (set per-instruction by the executor); we just need
 // arg_a=Rd and arg_b=imm8 (pre-scaled to imm8*4 stored as uint16_t).
