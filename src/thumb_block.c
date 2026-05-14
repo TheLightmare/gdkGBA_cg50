@@ -280,6 +280,7 @@ bool thumb_block_init(void) {
         thumb_block_dir[i].generation   = 0;
         thumb_block_dir[i].page_idx     = THUMB_PAGE_NONE;
         thumb_block_dir[i].page_gen     = 0;
+        thumb_block_dir[i].exec_count   = 0;
         thumb_block_dir[i].native_entry = NULL;
     }
 
@@ -429,16 +430,12 @@ const thumb_block_t *thumb_block_decode(uint32_t inst_pc) {
     // interpreter path. Explicit because we may be overwriting an entry
     // from a different PC that hashed here.
     slot->native_entry = NULL;
+    // Phase 2 chunk 8: defer JIT until the block proves hot. See
+    // thumb_block.h for the rationale; the executor in arm.c does the
+    // increment and threshold check.
+    slot->exec_count   = 0;
 
     thumb_uop_pool_head += length;
-
-#if GBA_JIT_THUMB
-    // Phase 1 Chunk 1: try to JIT-compile this block. On any failure
-    // (arena full, block too long for the literal-pool disp, etc.)
-    // native_entry stays NULL and the executor falls back to walking
-    // the uop list.
-    (void)thumb_jit_compile_block(slot);
-#endif
 
     return slot;
 }

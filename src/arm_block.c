@@ -263,6 +263,7 @@ bool arm_block_init(void) {
         arm_block_dir[i].generation   = 0;
         arm_block_dir[i].page_idx     = ARM_PAGE_NONE;
         arm_block_dir[i].page_gen     = 0;
+        arm_block_dir[i].exec_count   = 0;
         arm_block_dir[i].native_entry = NULL;
     }
 
@@ -377,14 +378,12 @@ const arm_block_t *arm_block_decode(uint32_t inst_pc) {
     // interpreter path. Explicit because we may be overwriting an entry
     // from a different PC that hashed here.
     slot->native_entry = NULL;
+    // Phase 2 chunk 8: start the hot-block counter at zero. JIT compile
+    // is deferred until the block has executed ARM_JIT_HOT_THRESHOLD
+    // times via the uop-list path. See arm.c executor.
+    slot->exec_count   = 0;
 
     arm_uop_pool_head += length;
 
-#if GBA_JIT_ARM
-    // Phase 1 Chunk 4: try to JIT-compile the block. On any failure
-    // (arena full, block too long, etc.) native_entry stays NULL and
-    // the executor falls back to walking the uop list.
-    (void)arm_jit_compile_block(slot);
-#endif
     return slot;
 }

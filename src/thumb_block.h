@@ -68,6 +68,14 @@ typedef struct {
     uint16_t generation;     // matches pool's current_gen, else stale
     uint16_t page_idx;       // RAM page; 0xFFFF for ROM blocks
     uint16_t page_gen;       // RAM page gen at decode time (ignored for ROM)
+    // Phase 2 chunk 8: hot-block JIT counter. Incremented on every
+    // uop-list execution of this block; once it reaches THUMB_JIT_HOT
+    // (defined in thumb_block.c) the executor attempts to JIT-compile.
+    // Capped at the threshold so the increment is a no-op for hot
+    // blocks that have already been compiled (or that the JIT
+    // declined to compile -- e.g. arena full). Keeps the per-uop
+    // pool dispatch on the hot-path free of overhead.
+    uint16_t exec_count;
     // Phase 0 JIT slot. NULL = walk uops via thumb_uop_pool[ops_offset];
     // non-NULL = call this SH4 routine with &arm_r in R4. The executor
     // pre-credits total_cycles before the call. See docs/SH4_JIT_PLAN.md.

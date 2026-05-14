@@ -5,12 +5,25 @@
 
 #include "arm.h"
 #include "arm_block.h"
+#include "arm_jit.h"
 #include "arm_mem.h"
 #include "arm_shared.h"
 #include "bench.h"
 #include "build_flags.h"
 #include "mem_swizzle.h"
 #include "thumb_block.h"
+#include "thumb_jit.h"
+
+// Phase 2 chunk 8: hot-block JIT threshold. A block must execute via
+// the uop-list path this many times before the executor attempts to
+// JIT-compile it. The original chunks-1-7 approach JIT-compiled every
+// block on first decode, which floods the 1 MB arena with boot/title
+// blocks before gameplay code arrives. Deferring until the block
+// proves hot leaves arena room for the code that actually matters.
+//
+// 4 is a starting threshold: enough to skip true one-shot init code,
+// low enough that warm code gets JIT'd within a frame or two.
+#define JIT_HOT_THRESHOLD 4u
 
 #include "io.h"
 #include "timer.h"
@@ -4513,6 +4526,22 @@ void arm_exec(uint32_t target_cycles) {
                             }
                             continue;
                         }
+#if GBA_JIT_THUMB
+                        // Phase 2 chunk 8: bump hot-block counter on
+                        // each uop-list execution; trigger JIT at
+                        // threshold. The cast strips const from the
+                        // lookup-time pointer (the cache itself is
+                        // mutable; const was just the API). If JIT
+                        // succeeds, native_entry is set and the next
+                        // iteration takes the native path above.
+                        if (b->exec_count < JIT_HOT_THRESHOLD) {
+                            thumb_block_t *bw = (thumb_block_t *)b;
+                            bw->exec_count++;
+                            if (bw->exec_count == JIT_HOT_THRESHOLD) {
+                                (void)thumb_jit_compile_block(bw);
+                            }
+                        }
+#endif
                         const thumb_uop_t *ops =
                             thumb_uop_pool + b->ops_offset;
                         arm_cycles += b->total_cycles;
@@ -4617,6 +4646,17 @@ void arm_exec(uint32_t target_cycles) {
                             }
                             continue;
                         }
+#if GBA_JIT_ARM
+                        // Phase 2 chunk 8: hot-block JIT (see Thumb
+                        // copy above for the rationale).
+                        if (b->exec_count < JIT_HOT_THRESHOLD) {
+                            arm_block_t *bw = (arm_block_t *)b;
+                            bw->exec_count++;
+                            if (bw->exec_count == JIT_HOT_THRESHOLD) {
+                                (void)arm_jit_compile_block(bw);
+                            }
+                        }
+#endif
                         const arm_uop_t *ops =
                             arm_uop_pool + b->ops_offset;
                         arm_cycles += b->total_cycles;

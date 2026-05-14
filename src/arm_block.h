@@ -45,6 +45,8 @@ typedef struct {
     uint16_t generation;
     uint16_t page_idx;       // 0xFFFF for ROM blocks
     uint16_t page_gen;
+    // Phase 2 chunk 8 hot-block JIT counter. See thumb_block.h.
+    uint16_t exec_count;
     // Phase 0 JIT slot -- see thumb_block.h for the convention.
     native_block_fn_t native_entry;
 } arm_block_t;
