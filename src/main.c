@@ -832,6 +832,7 @@ int main(void) {
                     "  thumb_ss=%lu (%lu/frame)  thumb_blk=%lu (%lu/frame)  thumb_blk_decodes=%lu\n"
                     "  arm_legacy=%lu (%lu/frame)  hist 0..F: %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n"
                     "  thumb_legacy=%lu (%lu/frame)  hist 0..F: %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n"
+                    "  thumb_jit_compiled=%lu  thumb_jit_specialized_ops=%lu\n"
                     "  slow_read=%lu  slow_write=%lu  chunk_miss=%lu\n",
                     (unsigned long)frames_in_span,
                     (unsigned long)bench_freq_hz,
@@ -888,6 +889,8 @@ int main(void) {
                     (unsigned long)bench_thumb_legacy_hist[0xD],
                     (unsigned long)bench_thumb_legacy_hist[0xE],
                     (unsigned long)bench_thumb_legacy_hist[0xF],
+                    (unsigned long)bench_thumb_jit_compiled,
+                    (unsigned long)bench_thumb_jit_specialized_ops,
                     (unsigned long)bench_mem_slow_read,
                     (unsigned long)bench_mem_slow_write,
                     (unsigned long)bench_chunk_miss);
@@ -911,6 +914,8 @@ int main(void) {
                 for (int hi = 0; hi < 16; hi++) bench_arm_legacy_hist[hi] = 0;
                 bench_thumb_legacy_inst = 0;
                 for (int hi = 0; hi < 16; hi++) bench_thumb_legacy_hist[hi] = 0;
+                bench_thumb_jit_compiled = 0;
+                bench_thumb_jit_specialized_ops = 0;
             }
             n = safe_append(buf, sizeof(buf), n, "\n");
 

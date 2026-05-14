@@ -111,6 +111,14 @@ extern uint32_t bench_arm_legacy_hist[16];
 extern uint32_t bench_thumb_legacy_inst;
 extern uint32_t bench_thumb_legacy_hist[16];
 
+// JIT coverage. bench_thumb_jit_compiled counts blocks that landed a
+// native_entry; bench_thumb_jit_specialized_ops counts uops inside
+// those blocks that got an inline specialisation (vs a JSR-to-handler
+// fallback). Useful for tracking how much of arm_exec the JIT actually
+// covers as we add per-opcode specialisations.
+extern uint32_t bench_thumb_jit_compiled;
+extern uint32_t bench_thumb_jit_specialized_ops;
+
 #else  // !GBA_BENCH
 
 // Release builds: bench is fully compiled out. Provide an inline no-op
